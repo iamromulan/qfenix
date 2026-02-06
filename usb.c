@@ -11,6 +11,7 @@
 #include "oscompat.h"
 
 #include "qdl.h"
+#include "diag_switch.h"
 
 #define DEFAULT_OUT_CHUNK_SIZE (1024 * 1024)
 
@@ -183,6 +184,7 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 	struct libusb_device *dev;
 	struct qdl_device_usb *qdl_usb = container_of(qdl, struct qdl_device_usb, base);
 	bool wait_printed = false;
+	bool diag_attempted = false;
 	bool found = false;
 	ssize_t n;
 	int ret;
@@ -211,6 +213,19 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 
 		if (found)
 			return 0;
+
+		/* Try DIAG-to-EDL switch if enabled and not yet attempted */
+		if (qdl_auto_edl && !diag_attempted) {
+			if (diag_is_device_in_diag_mode(serial)) {
+				ux_info("Device in DIAG mode, switching to EDL...\n");
+				if (diag_switch_to_edl(serial) == 0) {
+					ux_info("EDL switch sent, waiting for re-enumeration...\n");
+					sleep(3);
+				}
+				diag_attempted = true;
+				continue;
+			}
+		}
 
 		if (!wait_printed) {
 			ux_info("Waiting for EDL device\n");

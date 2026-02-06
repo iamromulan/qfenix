@@ -4,7 +4,9 @@
  * Copyright (c) 2018, The Linux Foundation. All rights reserved.
  * All rights reserved.
  */
+#define _GNU_SOURCE
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
@@ -22,9 +24,10 @@
 #include "ufs.h"
 #include "oscompat.h"
 #include "vip.h"
+#include "version.h"
 
 #ifdef _WIN32
-const char *__progname = "qdl";
+const char *__progname = "qfenix";
 #endif
 
 #define MAX_USBFS_BULK_SIZE	(16 * 1024)
@@ -408,14 +411,214 @@ static int decode_programmer(char *s, struct sahara_image *images)
 	return 0;
 }
 
+/*
+ * Firmware directory auto-detection
+ */
+struct firmware_files {
+	char *programmer;
+	char **rawprogram;
+	int rawprogram_count;
+	char **patch;
+	int patch_count;
+	enum qdl_storage_type storage_type;
+	char *firehose_dir;
+};
+
+static int match_file(const char *name, const char *prefix, const char *suffix)
+{
+	size_t name_len = strlen(name);
+	size_t prefix_len = strlen(prefix);
+	size_t suffix_len = strlen(suffix);
+
+	if (name_len < prefix_len + suffix_len)
+		return 0;
+
+	if (strncasecmp(name, prefix, prefix_len) != 0)
+		return 0;
+
+	if (strcasecmp(name + name_len - suffix_len, suffix) != 0)
+		return 0;
+
+	return 1;
+}
+
+static char *find_file_in_dir(const char *dir, const char *prefix, const char *suffix)
+{
+	struct dirent *entry;
+	char *result = NULL;
+	char path[PATH_MAX];
+	DIR *d;
+
+	d = opendir(dir);
+	if (!d)
+		return NULL;
+
+	while ((entry = readdir(d)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+
+		if (match_file(entry->d_name, prefix, suffix)) {
+			snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+			result = strdup(path);
+			break;
+		}
+	}
+
+	closedir(d);
+	return result;
+}
+
+static int find_files_in_dir(const char *dir, const char *prefix, const char *suffix,
+			     char ***files_out, int *count_out)
+{
+	struct dirent *entry;
+	char path[PATH_MAX];
+	char **files = NULL;
+	int count = 0;
+	int capacity = 0;
+	DIR *d;
+
+	d = opendir(dir);
+	if (!d)
+		return -1;
+
+	while ((entry = readdir(d)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+
+		if (match_file(entry->d_name, prefix, suffix)) {
+			if (count >= capacity) {
+				capacity = capacity ? capacity * 2 : 8;
+				files = realloc(files, capacity * sizeof(char *));
+			}
+			snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+			files[count++] = strdup(path);
+		}
+	}
+
+	closedir(d);
+	*files_out = files;
+	*count_out = count;
+	return 0;
+}
+
+static enum qdl_storage_type detect_storage_from_filename(const char *filename)
+{
+	if (strcasestr(filename, "_nand") || strcasestr(filename, "nand_"))
+		return QDL_STORAGE_NAND;
+	if (strcasestr(filename, "_emmc") || strcasestr(filename, "emmc_"))
+		return QDL_STORAGE_EMMC;
+	if (strcasestr(filename, "_ufs") || strcasestr(filename, "ufs_"))
+		return QDL_STORAGE_UFS;
+
+	return QDL_STORAGE_UFS; /* default */
+}
+
+static int firmware_detect(const char *base_dir, struct firmware_files *fw)
+{
+	char firehose_path[PATH_MAX];
+	char *dir;
+	int i;
+
+	memset(fw, 0, sizeof(*fw));
+	fw->storage_type = QDL_STORAGE_UFS;
+
+	/* Check for update/firehose subdirectory */
+	snprintf(firehose_path, sizeof(firehose_path), "%s/update/firehose", base_dir);
+	if (access(firehose_path, R_OK) == 0) {
+		dir = firehose_path;
+	} else {
+		/* Use base directory directly */
+		dir = (char *)base_dir;
+	}
+	fw->firehose_dir = strdup(dir);
+
+	/* Find programmer file */
+	fw->programmer = find_file_in_dir(dir, "prog_firehose_", ".elf");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_firehose_", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_nand_firehose_", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_emmc_firehose_", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_ufs_firehose_", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "firehose-prog", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_", ".mbn");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "prog_", ".elf");
+	if (!fw->programmer)
+		fw->programmer = find_file_in_dir(dir, "xbl_s_devprg_", ".melf");
+
+	if (!fw->programmer) {
+		ux_err("no programmer file found in %s\n", dir);
+		return -1;
+	}
+
+	/* Find rawprogram XML files */
+	find_files_in_dir(dir, "rawprogram", ".xml", &fw->rawprogram, &fw->rawprogram_count);
+	if (fw->rawprogram_count == 0) {
+		ux_err("no rawprogram XML files found in %s\n", dir);
+		return -1;
+	}
+
+	/* Detect storage type from first rawprogram filename */
+	fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
+
+	/* Find patch XML files */
+	find_files_in_dir(dir, "patch", ".xml", &fw->patch, &fw->patch_count);
+
+	ux_info("Firmware directory: %s\n", dir);
+	ux_info("  Programmer: %s\n", fw->programmer);
+	ux_info("  Storage type: %s\n",
+		fw->storage_type == QDL_STORAGE_NAND ? "nand" :
+		fw->storage_type == QDL_STORAGE_EMMC ? "emmc" :
+		fw->storage_type == QDL_STORAGE_UFS ? "ufs" : "unknown");
+	ux_info("  Program files: %d\n", fw->rawprogram_count);
+	for (i = 0; i < fw->rawprogram_count; i++)
+		ux_info("    %s\n", fw->rawprogram[i]);
+	ux_info("  Patch files: %d\n", fw->patch_count);
+	for (i = 0; i < fw->patch_count; i++)
+		ux_info("    %s\n", fw->patch[i]);
+
+	return 0;
+}
+
+static void firmware_free(struct firmware_files *fw)
+{
+	int i;
+
+	free(fw->programmer);
+	free(fw->firehose_dir);
+
+	for (i = 0; i < fw->rawprogram_count; i++)
+		free(fw->rawprogram[i]);
+	free(fw->rawprogram);
+
+	for (i = 0; i < fw->patch_count; i++)
+		free(fw->patch[i]);
+	free(fw->patch);
+}
+
 static void print_usage(FILE *out)
 {
 	extern const char *__progname;
 
+	fprintf(out, "qfenix\n");
+	fprintf(out, "A qdl fork that aims to add more features, by iamromulan.\n");
+#ifdef BUILD_STATIC
+	fprintf(out, "qfenix %s, %s %s, static binary\n\n", VERSION, __DATE__, __TIME__);
+#else
+	fprintf(out, "qfenix %s, %s %s, dynamically linked\n\n", VERSION, __DATE__, __TIME__);
+#endif
 	fprintf(out, "Usage: %s [options] <prog.mbn> (<program-xml> | <patch-xml> | <read-xml>)...\n", __progname);
+	fprintf(out, "       %s [options] -F <firmware-dir>\n", __progname);
 	fprintf(out, "       %s [options] <prog.mbn> ((read | write) <address> <binary>)...\n", __progname);
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
+	fprintf(out, "\nOptions:\n");
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
 	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
@@ -428,7 +631,11 @@ static void print_usage(FILE *out)
 	fprintf(out, " -t, --create-digests=T\t\tGenerate table of digests in the T folder\n");
 	fprintf(out, " -T, --slot=T\t\t\tSet slot number T for multiple storage devices\n");
 	fprintf(out, " -D, --vip-table-path=T\t\tUse digest tables in the T folder for VIP\n");
+	fprintf(out, " -E, --no-auto-edl\t\tDisable automatic DIAG to EDL mode switching\n");
+	fprintf(out, " -M, --skip-md5\t\t\tSkip MD5 verification of firmware files\n");
+	fprintf(out, " -F, --firmware-dir=T\t\tAuto-detect and load firmware from directory T\n");
 	fprintf(out, " -h, --help\t\t\tPrint this usage info\n");
+	fprintf(out, "\nArguments:\n");
 	fprintf(out, " <program-xml>\t\txml file containing <program> or <erase> directives\n");
 	fprintf(out, " <patch-xml>\t\txml file containing <patch> directives\n");
 	fprintf(out, " <read-xml>\t\txml file containing <read> directives\n");
@@ -437,8 +644,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "          \t\tnumber S, the number of sectors to follow L, or partition by \"name\"\n");
 	fprintf(out, " <ramdump-path>\t\tpath where ramdump should stored\n");
 	fprintf(out, " <segment-filter>\toptional glob-pattern to select which segments to ramdump\n");
-	fprintf(out, "\n");
-	fprintf(out, "Example: %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
+	fprintf(out, "\nExample: %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
 }
 
 static int qdl_list(FILE *out)
@@ -545,16 +751,20 @@ static int qdl_flash(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct sahara_image sahara_images[MAPPING_SZ] = {};
+	struct firmware_files fw = {};
 	char *incdir = NULL;
 	char *serial = NULL;
+	char *firmware_dir = NULL;
 	const char *vip_generate_dir = NULL;
 	const char *vip_table_path = NULL;
 	int type;
 	int ret;
 	int opt;
+	int i;
 	bool qdl_finalize_provisioning = false;
 	bool allow_fusing = false;
 	bool allow_missing = false;
+	bool storage_type_set = false;
 	long out_chunk_size = 0;
 	unsigned int slot = UINT_MAX;
 	struct qdl_device *qdl = NULL;
@@ -574,11 +784,14 @@ static int qdl_flash(int argc, char **argv)
 		{"dry-run", no_argument, 0, 'n'},
 		{"create-digests", required_argument, 0, 't'},
 		{"slot", required_argument, 0, 'T'},
+		{"no-auto-edl", no_argument, 0, 'E'},
+		{"skip-md5", no_argument, 0, 'M'},
+		{"firmware-dir", required_argument, 0, 'F'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:h", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -611,6 +824,7 @@ static int qdl_flash(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_type_set = true;
 			break;
 		case 'S':
 			serial = optarg;
@@ -621,6 +835,15 @@ static int qdl_flash(int argc, char **argv)
 		case 'T':
 			slot = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
+		case 'E':
+			qdl_auto_edl = false;
+			break;
+		case 'M':
+			qdl_skip_md5 = true;
+			break;
+		case 'F':
+			firmware_dir = optarg;
+			break;
 		case 'h':
 			print_usage(stdout);
 			return 0;
@@ -630,8 +853,21 @@ static int qdl_flash(int argc, char **argv)
 		}
 	}
 
-	/* at least 2 non optional args required */
-	if ((optind + 2) > argc) {
+	/* Handle firmware directory mode or require 2+ args */
+	if (firmware_dir) {
+		ret = firmware_detect(firmware_dir, &fw);
+		if (ret < 0) {
+			ux_err("failed to detect firmware in %s\n", firmware_dir);
+			return 1;
+		}
+
+		/* Use detected storage type unless explicitly set */
+		if (!storage_type_set)
+			storage_type = fw.storage_type;
+
+		/* Use firehose directory as include directory */
+		incdir = fw.firehose_dir;
+	} else if ((optind + 2) > argc) {
 		print_usage(stderr);
 		return 1;
 	}
@@ -666,64 +902,96 @@ static int qdl_flash(int argc, char **argv)
 	if (qdl_debug)
 		print_version();
 
-	ret = decode_programmer(argv[optind++], sahara_images);
-	if (ret < 0)
-		exit(1);
+	if (firmware_dir) {
+		/* Firmware directory mode: load auto-detected files */
+		ret = decode_programmer(fw.programmer, sahara_images);
+		if (ret < 0)
+			exit(1);
 
-	do {
-		type = detect_type(argv[optind]);
-		if (type < 0 || type == QDL_FILE_UNKNOWN)
-			errx(1, "failed to detect file type of %s\n", argv[optind]);
-
-		switch (type) {
-		case QDL_FILE_PATCH:
-			ret = patch_load(argv[optind]);
+		/* Load all rawprogram files */
+		for (i = 0; i < fw.rawprogram_count; i++) {
+			ret = program_load(fw.rawprogram[i], storage_type == QDL_STORAGE_NAND,
+					   allow_missing, incdir);
 			if (ret < 0)
-				errx(1, "patch_load %s failed", argv[optind]);
-			break;
-		case QDL_FILE_PROGRAM:
-			ret = program_load(argv[optind], storage_type == QDL_STORAGE_NAND, allow_missing, incdir);
-			if (ret < 0)
-				errx(1, "program_load %s failed", argv[optind]);
-
-			if (!allow_fusing && program_is_sec_partition_flashed())
-				errx(1, "secdata partition to be programmed, which can lead to irreversible"
-					" changes. Allow explicitly with --allow-fusing parameter");
-			break;
-		case QDL_FILE_READ:
-			ret = read_op_load(argv[optind], incdir);
-			if (ret < 0)
-				errx(1, "read_op_load %s failed", argv[optind]);
-			break;
-		case QDL_FILE_UFS:
-			if (storage_type != QDL_STORAGE_UFS)
-				errx(1, "attempting to load provisioning config when storage isn't \"ufs\"");
-
-			ret = ufs_load(argv[optind], qdl_finalize_provisioning);
-			if (ret < 0)
-				errx(1, "ufs_load %s failed", argv[optind]);
-			break;
-		case QDL_CMD_READ:
-			if (optind + 2 >= argc)
-				errx(1, "read command missing arguments");
-			ret = read_cmd_add(argv[optind + 1], argv[optind + 2]);
-			if (ret < 0)
-				errx(1, "failed to add read command");
-			optind += 2;
-			break;
-		case QDL_CMD_WRITE:
-			if (optind + 2 >= argc)
-				errx(1, "write command missing arguments");
-			ret = program_cmd_add(argv[optind + 1], argv[optind + 2]);
-			if (ret < 0)
-				errx(1, "failed to add write command");
-			optind += 2;
-			break;
-		default:
-			errx(1, "%s type not yet supported", argv[optind]);
-			break;
+				errx(1, "program_load %s failed", fw.rawprogram[i]);
 		}
-	} while (++optind < argc);
+
+		/* Load all patch files */
+		for (i = 0; i < fw.patch_count; i++) {
+			ret = patch_load(fw.patch[i]);
+			if (ret < 0)
+				errx(1, "patch_load %s failed", fw.patch[i]);
+		}
+
+		if (!allow_fusing && program_is_sec_partition_flashed())
+			errx(1, "secdata partition to be programmed, which can lead to irreversible"
+				" changes. Allow explicitly with --allow-fusing parameter");
+	} else {
+		/* Manual mode: load files from command line */
+		ret = decode_programmer(argv[optind++], sahara_images);
+		if (ret < 0)
+			exit(1);
+
+		do {
+			type = detect_type(argv[optind]);
+			if (type < 0 || type == QDL_FILE_UNKNOWN)
+				errx(1, "failed to detect file type of %s\n", argv[optind]);
+
+			switch (type) {
+			case QDL_FILE_PATCH:
+				ret = patch_load(argv[optind]);
+				if (ret < 0)
+					errx(1, "patch_load %s failed", argv[optind]);
+				break;
+			case QDL_FILE_PROGRAM:
+				ret = program_load(argv[optind], storage_type == QDL_STORAGE_NAND, allow_missing, incdir);
+				if (ret < 0)
+					errx(1, "program_load %s failed", argv[optind]);
+
+				if (!allow_fusing && program_is_sec_partition_flashed())
+					errx(1, "secdata partition to be programmed, which can lead to irreversible"
+						" changes. Allow explicitly with --allow-fusing parameter");
+				break;
+			case QDL_FILE_READ:
+				ret = read_op_load(argv[optind], incdir);
+				if (ret < 0)
+					errx(1, "read_op_load %s failed", argv[optind]);
+				break;
+			case QDL_FILE_UFS:
+				if (storage_type != QDL_STORAGE_UFS)
+					errx(1, "attempting to load provisioning config when storage isn't \"ufs\"");
+
+				ret = ufs_load(argv[optind], qdl_finalize_provisioning);
+				if (ret < 0)
+					errx(1, "ufs_load %s failed", argv[optind]);
+				break;
+			case QDL_CMD_READ:
+				if (optind + 2 >= argc)
+					errx(1, "read command missing arguments");
+				ret = read_cmd_add(argv[optind + 1], argv[optind + 2]);
+				if (ret < 0)
+					errx(1, "failed to add read command");
+				optind += 2;
+				break;
+			case QDL_CMD_WRITE:
+				if (optind + 2 >= argc)
+					errx(1, "write command missing arguments");
+				ret = program_cmd_add(argv[optind + 1], argv[optind + 2]);
+				if (ret < 0)
+					errx(1, "failed to add write command");
+				optind += 2;
+				break;
+			default:
+				errx(1, "%s type not yet supported", argv[optind]);
+				break;
+			}
+		} while (++optind < argc);
+	}
+
+	/* Verify MD5 checksums before connecting to device */
+	ret = program_verify_md5();
+	if (ret < 0)
+		goto out_cleanup;
 
 	ret = qdl_open(qdl, serial);
 	if (ret)
@@ -749,6 +1017,9 @@ out_cleanup:
 	qdl_close(qdl);
 	free_programs();
 	free_patches();
+
+	if (firmware_dir)
+		firmware_free(&fw);
 
 	if (qdl->vip_data.state != VIP_DISABLED)
 		vip_transfer_deinit(qdl);

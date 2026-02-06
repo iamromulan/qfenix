@@ -19,13 +19,40 @@
 #include "oscompat.h"
 #include "sparse.h"
 #include "gpt.h"
+#include "md5.h"
 
 static struct list_head programs = LIST_INIT(programs);
+
+bool qdl_skip_md5 = false;
+
+/*
+ * Normalize Windows-style paths to Unix-style
+ * Converts backslashes to forward slashes in-place
+ */
+static void normalize_path(char *path)
+{
+	char *p;
+
+	if (!path)
+		return;
+
+	for (p = path; *p; p++) {
+		if (*p == '\\')
+			*p = '/';
+	}
+}
 
 static int load_erase_tag(xmlNode *node, bool is_nand)
 {
 	struct program *program;
 	int errors = 0;
+
+	/*
+	 * Skip vendor-specific metadata tags (e.g., Quectel firmware uses
+	 * <erase vendor="quectel" ...> as metadata, not actual erase commands)
+	 */
+	if (xmlGetProp(node, (xmlChar *)"vendor"))
+		return 0;
 
 	program = calloc(1, sizeof(struct program));
 
@@ -162,11 +189,30 @@ static int load_program_tag(xmlNode *node, bool is_nand, bool allow_missing, con
 
 	program->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
 	program->filename = attr_as_string(node, "filename", &errors);
-	program->label = attr_as_string(node, "label", &errors);
+	normalize_path((char *)program->filename);
 	program->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
 	program->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
-	program->sparse = attr_as_bool(node, "sparse", &errors);
 	program->start_sector = attr_as_string(node, "start_sector", &errors);
+
+	/* Label is optional - use filename as fallback */
+	if (xmlGetProp(node, (xmlChar *)"label")) {
+		int label_errors = 0;
+		program->label = attr_as_string(node, "label", &label_errors);
+	} else if (program->filename) {
+		program->label = strdup(program->filename);
+	}
+
+	/* Sparse is optional, defaults to false */
+	if (xmlGetProp(node, (xmlChar *)"sparse")) {
+		int sparse_errors = 0;
+		program->sparse = attr_as_bool(node, "sparse", &sparse_errors);
+	}
+
+	/* MD5 is optional - parse it without adding to error count */
+	if (xmlGetProp(node, (xmlChar *)"md5")) {
+		int md5_errors = 0;
+		program->md5 = attr_as_string(node, "md5", &md5_errors);
+	}
 
 	if (is_nand) {
 		program->pages_per_block = attr_as_unsigned(node, "PAGES_PER_BLOCK", &errors);
@@ -392,6 +438,7 @@ void free_programs(void)
 	list_for_each_entry_safe(program, next, &programs, node) {
 		free((void *)program->filename);
 		free((void *)program->label);
+		free((void *)program->md5);
 		free((void *)program->start_sector);
 		free((void *)program->gpt_partition);
 		free(program);
@@ -453,6 +500,51 @@ int program_resolve_gpt_deferrals(struct qdl_device *qdl)
 
 		sprintf(buf, "%u", start_sector);
 		program->start_sector = strdup(buf);
+	}
+
+	return 0;
+}
+
+int program_verify_md5(void)
+{
+	struct program *program;
+	uint8_t digest[MD5_DIGEST_LENGTH];
+	char computed[MD5_DIGEST_STRING_LENGTH];
+	int verified = 0;
+	int failed = 0;
+
+	if (qdl_skip_md5) {
+		ux_info("MD5 verification skipped\n");
+		return 0;
+	}
+
+	list_for_each_entry(program, &programs, node) {
+		if (program->is_erase || !program->filename || !program->md5)
+			continue;
+
+		if (md5_file(program->filename, digest) < 0) {
+			ux_err("failed to compute MD5 for %s\n", program->filename);
+			failed++;
+			continue;
+		}
+
+		if (md5_compare(program->md5, digest) != 0) {
+			md5_to_string(digest, computed);
+			ux_err("MD5 mismatch for %s\n", program->filename);
+			ux_err("  expected: %s\n", program->md5);
+			ux_err("  computed: %s\n", computed);
+			failed++;
+		} else {
+			verified++;
+		}
+	}
+
+	if (verified > 0)
+		ux_info("MD5 verified: %d files\n", verified);
+
+	if (failed > 0) {
+		ux_err("MD5 verification failed for %d files\n", failed);
+		return -1;
 	}
 
 	return 0;

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 #include "oscompat.h"
 
 extern const char *__progname;
@@ -71,6 +72,26 @@ void warnx(const char *fmt, ...)
 		vfprintf(stderr, fmt, ap);
 	fprintf(stderr, "\n");
 	va_end(ap);
+}
+
+char *strcasestr(const char *haystack, const char *needle)
+{
+	size_t needle_len;
+
+	if (!needle || !haystack)
+		return NULL;
+
+	needle_len = strlen(needle);
+	if (needle_len == 0)
+		return (char *)haystack;
+
+	while (*haystack) {
+		if (strncasecmp(haystack, needle, needle_len) == 0)
+			return (char *)haystack;
+		haystack++;
+	}
+
+	return NULL;
 }
 
 #endif // _WIN32

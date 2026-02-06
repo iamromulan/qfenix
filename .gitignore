@@ -1,8 +1,8 @@
 *.1
 *.o
-qdl
-qdl-ramdump
-ks
+qfenix
+qfenix-ramdump
+qfenix-ks
 *.exe
 compile_commands.json
 .cache
@@ -10,3 +10,5 @@ compile_commands.json
 version.h
 scripts
 .checkpatch-camelcase.git.
+.scripts/
+CLAUDE.md

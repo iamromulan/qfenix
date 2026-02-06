@@ -20,6 +20,8 @@ void errx(int eval, const char *fmt, ...);
 void warn(const char *fmt, ...);
 void warnx(const char *fmt, ...);
 
+char *strcasestr(const char *haystack, const char *needle);
+
 #endif
 
 #endif
