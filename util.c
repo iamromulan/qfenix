@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <unistd.h>
@@ -18,6 +19,58 @@
 #include "oscompat.h"
 #include "qdl.h"
 #include "version.h"
+
+/*
+ * Normalize Windows-style paths to Unix-style.
+ * Converts backslashes to forward slashes in-place.
+ */
+void normalize_path(char *path)
+{
+	char *p;
+
+	if (!path)
+		return;
+
+	for (p = path; *p; p++) {
+		if (*p == '\\')
+			*p = '/';
+	}
+}
+
+/*
+ * Create parent directories for the given file path.
+ * Similar to "mkdir -p" for the directory portion of a path.
+ */
+int mkpath(const char *file_path)
+{
+	char *path;
+	char *p;
+
+	if (!file_path)
+		return -1;
+
+	path = strdup(file_path);
+	if (!path)
+		return -1;
+
+	for (p = path + 1; *p; p++) {
+		if (*p == '/') {
+			*p = '\0';
+#ifdef _WIN32
+			if (mkdir(path) < 0 && errno != EEXIST) {
+#else
+			if (mkdir(path, 0755) < 0 && errno != EEXIST) {
+#endif
+				free(path);
+				return -1;
+			}
+			*p = '/';
+		}
+	}
+
+	free(path);
+	return 0;
+}
 
 static uint8_t to_hex(uint8_t ch)
 {

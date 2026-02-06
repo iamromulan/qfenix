@@ -37,6 +37,8 @@ int patch_load_tag(xmlNode *node)
 		return -EINVAL;
 	}
 
+	normalize_path((char *)patch->filename);
+
 	list_add(&patches, &patch->node);
 	firehose_op_add_patch(patch);
 

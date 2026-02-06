@@ -38,10 +38,11 @@ int read_op_load_tag(xmlNode *node, const char *incdir)
 		return -EINVAL;
 	}
 
+	normalize_path((char *)read_op->filename);
+
 	if (incdir) {
 		snprintf(tmp, PATH_MAX, "%s/%s", incdir, read_op->filename);
-		if (access(tmp, F_OK) != -1)
-			read_op->filename = strdup(tmp);
+		read_op->filename = strdup(tmp);
 	}
 
 	list_add(&read_ops, &read_op->node);
@@ -86,6 +87,7 @@ int read_op_execute(struct qdl_device *qdl, int (*apply)(struct qdl_device *qdl,
 	int fd;
 
 	list_for_each_entry(read_op, &read_ops, node) {
+		mkpath(read_op->filename);
 		fd = open(read_op->filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 		if (fd < 0) {
 			ux_info("unable to open %s...\n", read_op->filename);

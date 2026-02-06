@@ -25,22 +25,7 @@ static struct list_head programs = LIST_INIT(programs);
 
 bool qdl_skip_md5 = false;
 
-/*
- * Normalize Windows-style paths to Unix-style
- * Converts backslashes to forward slashes in-place
- */
-static void normalize_path(char *path)
-{
-	char *p;
-
-	if (!path)
-		return;
-
-	for (p = path; *p; p++) {
-		if (*p == '\\')
-			*p = '/';
-	}
-}
+/* normalize_path() moved to util.c */
 
 static int load_erase_tag(xmlNode *node, bool is_nand)
 {

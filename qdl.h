@@ -119,6 +119,8 @@ void ux_log(const char *fmt, ...);
 void ux_debug(const char *fmt, ...);
 void ux_progress(const char *fmt, unsigned int value, unsigned int size, ...);
 
+void normalize_path(char *path);
+int mkpath(const char *file_path);
 void print_version(void);
 
 int parse_storage_address(const char *address, int *physical_partition,

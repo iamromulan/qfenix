@@ -83,6 +83,7 @@ int firehose_op_execute(struct qdl_device *qdl,
 				return ret;
 			break;
 		case OP_READ:
+			mkpath(op->read_op->filename);
 			fd = open(op->read_op->filename,
 				  O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 			if (fd < 0) {
