@@ -94,6 +94,50 @@ jobs:
             qfenix-ramdump
             qfenix-ks
 
+  # Linux ARM32 - TRUE STATIC using QEMU emulation in Alpine ARM container
+  build-linux-arm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU for ARM emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build static ARM32 binary in Alpine container
+        run: |
+          docker run --rm --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:latest sh -c '
+              apk add --no-cache \
+                build-base git bash pkgconf linux-headers \
+                libxml2-dev libxml2-static \
+                libusb-dev zlib-dev zlib-static \
+                xz-dev xz-static eudev-dev eudev-libs
+
+              git config --global --add safe.directory /workspace
+
+              make CFLAGS="-O2 -Wall -g -DBUILD_STATIC $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+                   LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0) -ludev -lpthread -lm"
+
+              echo "=== Verify ARM32 static ==="
+              file qfenix
+            '
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm
+          path: |
+            qfenix
+            qfenix-ramdump
+            qfenix-ks
+
   # macOS ARM64 - Static third-party libs, dynamic system frameworks
   build-macos-arm64:
     runs-on: macos-14
@@ -341,8 +385,169 @@ jobs:
             qfenix.exe
             qfenix-ramdump.exe
             qfenix-ks.exe
+  # Windows x86 (32-bit) - True static build
+  build-windows-x86:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          install: >
+            base-devel git
+            mingw-w64-i686-gcc
+            mingw-w64-i686-pkg-config
+            mingw-w64-i686-libxml2
+            mingw-w64-i686-libusb
+            mingw-w64-i686-xz
+            mingw-w64-i686-zlib
+
+      - name: Build static
+        shell: msys2 {0}
+        run: |
+          # Verify static libraries exist
+          echo "=== Checking for static libraries ==="
+          ls -la /mingw32/lib/libxml2.a /mingw32/lib/libusb-1.0.a /mingw32/lib/liblzma.a /mingw32/lib/libz.a /mingw32/lib/libiconv.a 2>&1 || true
+
+          # Hide DLL import libraries so linker must use static libs
+          echo "=== Hiding DLL import libraries ==="
+          for lib in libxml2 libusb-1.0 liblzma libz libiconv; do
+            if [ -f "/mingw32/lib/${lib}.dll.a" ]; then
+              mv "/mingw32/lib/${lib}.dll.a" "/mingw32/lib/${lib}.dll.a.bak"
+              echo "Hid ${lib}.dll.a"
+            fi
+          done
+
+          # Static defines tell headers not to use __declspec(dllimport)
+          STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
+
+          # Build with static flags
+          make CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+               LDFLAGS="-static -static-libgcc $(pkg-config --libs --static libxml-2.0 libusb-1.0) -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi"
+
+          echo "=== Verify static build ==="
+          file qfenix.exe
+          echo "=== DLL dependencies ==="
+          objdump -p qfenix.exe | grep "DLL Name" || echo "No DLL dependencies"
+
+          # Restore DLL import libraries
+          for lib in libxml2 libusb-1.0 liblzma libz libiconv; do
+            if [ -f "/mingw32/lib/${lib}.dll.a.bak" ]; then
+              mv "/mingw32/lib/${lib}.dll.a.bak" "/mingw32/lib/${lib}.dll.a"
+            fi
+          done
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: make tests
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86
+          path: |
+            qfenix.exe
+            qfenix-ramdump.exe
+            qfenix-ks.exe
+
+  # Windows ARM64 - Cross-compiled with llvm-mingw
+  build-windows-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install llvm-mingw and build dependencies
+        run: |
+          # Download llvm-mingw toolchain
+          curl -sL https://github.com/mstorsjo/llvm-mingw/releases/download/20250114/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64.tar.xz | tar xJ
+          export PATH="$(pwd)/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64/bin:$PATH"
+          echo "$(pwd)/llvm-mingw-20250114-ucrt-ubuntu-20.04-x86_64/bin" >> $GITHUB_PATH
+
+          # Verify cross-compiler works
+          aarch64-w64-mingw32-gcc --version
+
+          PREFIX="$(pwd)/arm64-deps"
+          mkdir -p "$PREFIX"
+
+          # Build zlib
+          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          cd zlib-1.3.1
+          CC=aarch64-w64-mingw32-gcc AR=aarch64-w64-mingw32-ar RANLIB=aarch64-w64-mingw32-ranlib \
+            ./configure --static --prefix="$PREFIX"
+          make -j$(nproc) && make install
+          cd ..
+
+          # Build liblzma
+          curl -sL https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.gz | tar xz
+          cd xz-5.6.3
+          ./configure --host=aarch64-w64-mingw32 --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$(nproc) && make install
+          cd ..
+
+          # Build libxml2
+          curl -sL https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.9.tar.xz | tar xJ
+          cd libxml2-2.12.9
+          ./configure --host=aarch64-w64-mingw32 --enable-static --disable-shared --without-python \
+            --prefix="$PREFIX" --with-zlib="$PREFIX" --with-lzma="$PREFIX" \
+            CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib"
+          make -j$(nproc) && make install
+          cd ..
+
+          # Build libusb
+          curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 | tar xj
+          cd libusb-1.0.27
+          ./configure --host=aarch64-w64-mingw32 --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$(nproc) && make install
+          cd ..
+
+          echo "=== Static libraries ==="
+          ls -la "$PREFIX/lib/"*.a
+
+      - name: Build static
+        run: |
+          PREFIX="$(pwd)/arm64-deps"
+
+          STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
+          CFLAGS="-O2 -Wall -g $STATIC_DEFINES -I$PREFIX/include/libxml2 -I$PREFIX/include/libusb-1.0 -I$PREFIX/include"
+          LDFLAGS="$PREFIX/lib/libxml2.a $PREFIX/lib/libusb-1.0.a $PREFIX/lib/liblzma.a $PREFIX/lib/libz.a -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi -liconv -static -static-libgcc"
+
+          echo "CFLAGS: $CFLAGS"
+          echo "LDFLAGS: $LDFLAGS"
+
+          # Create pkg-config wrapper that returns empty
+          cat > /tmp/pkg-config-nolibs <<'SCRIPT'
+          #!/bin/bash
+          exit 0
+          SCRIPT
+          chmod +x /tmp/pkg-config-nolibs
+
+          make CC=aarch64-w64-mingw32-gcc \
+               PKG_CONFIG=/tmp/pkg-config-nolibs \
+               CFLAGS="$CFLAGS" \
+               LDFLAGS="$LDFLAGS"
+
+          echo "=== Verify build ==="
+          file qfenix.exe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: |
+            qfenix.exe
+            qfenix-ramdump.exe
+            qfenix-ks.exe
+
   create-release:
-    needs: [build-linux-x64, build-linux-arm64, build-macos-arm64, build-macos-x64, build-windows-x64]
+    needs: [build-linux-x64, build-linux-arm64, build-linux-arm, build-macos-arm64, build-macos-x64, build-windows-x64, build-windows-x86, build-windows-arm64]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -357,16 +562,18 @@ jobs:
         run: |
           cd artifacts
 
-          for dir in linux-x64 linux-arm64 macos-arm64 macos-x64; do
+          for dir in linux-x64 linux-arm64 linux-arm macos-arm64 macos-x64; do
             cd $dir
             chmod +x qfenix qfenix-ramdump qfenix-ks 2>/dev/null || true
             tar -czvf ../qfenix-${dir}.tar.gz *
             cd ..
           done
 
-          cd windows-x64
-          zip -r ../qfenix-windows-x64.zip *
-          cd ..
+          for dir in windows-x64 windows-x86 windows-arm64; do
+            cd $dir
+            zip -r ../qfenix-${dir}.zip *
+            cd ..
+          done
 
           ls -la *.tar.gz *.zip
 
@@ -376,8 +583,11 @@ jobs:
           files: |
             artifacts/qfenix-linux-x64.tar.gz
             artifacts/qfenix-linux-arm64.tar.gz
+            artifacts/qfenix-linux-arm.tar.gz
             artifacts/qfenix-macos-arm64.tar.gz
             artifacts/qfenix-macos-x64.tar.gz
             artifacts/qfenix-windows-x64.zip
+            artifacts/qfenix-windows-x86.zip
+            artifacts/qfenix-windows-arm64.zip
           draft: false
           prerelease: false
