@@ -17,10 +17,15 @@ These are all static/standalone binaries with the exeption of the macOS binaries
 This fork adds several features while maintaining full backwards compatibility with
 the original QDL:
 
-- **Automatic Firmware Detection** (`-F` / `--firmware-dir`) - Point to a Quectel format firmware
-  directory and QFenix auto-detects the programmer, XML files, and storage type
+- **Automatic Firmware Detection** (`-F` / `--firmware-dir`) - Point to any firmware
+  directory and QFenix recursively searches for the programmer, rawprogram/patch/rawread
+  XMLs, and auto-detects the storage type. Works with any directory layout.
+- **Document-Order XML Execution** - Erase, program, and read commands execute in the
+  exact order they appear in the XML files. The original QDL groups all erases first,
+  then all programs, losing the intended sequence. QFenix preserves it, enabling
+  workflows like backup-then-erase-then-flash within a single XML.
 - **DIAG to EDL Auto-Switching** - Automatically switches devices from DIAG mode to
-  EDL mode (can be disabled with `--no-auto-edl`)
+  EDL mode (can be disabled with `--no-auto-edl`). Works on both Linux and Windows.
 - **MD5 Verification** - Verifies firmware file integrity before flashing when MD5
   checksums are present in the XML (can be skipped with `--skip-md5`)
 - **Improved NAND Support** - Fixes for NAND device flashing (last_sector handling)
@@ -43,7 +48,7 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 
 | Option | Description |
 |--------|-------------|
-| `-F, --firmware-dir=PATH` | Auto-detect and load firmware from directory |
+| `-F, --firmware-dir=PATH` | Recursively auto-detect and load firmware from directory |
 | `-E, --no-auto-edl` | Disable automatic DIAG to EDL mode switching |
 | `-M, --skip-md5` | Skip MD5 verification of firmware files |
 
@@ -67,7 +72,7 @@ Run with the `--help` option to view detailed usage information.
 **Firmware directory mode (recommended for Quectel firmware):**
 
 ```bash
-# Automatically detects programmer, XMLs, and storage type
+# Recursively finds programmer, XMLs, and detects storage type
 qfenix -F /path/to/extracted/firmware/
 ```
 

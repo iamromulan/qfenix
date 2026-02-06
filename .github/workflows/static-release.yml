@@ -606,4 +606,4 @@ jobs:
             artifacts/qfenix-windows-x86.zip
             artifacts/qfenix-windows-arm64.zip
           draft: false
-          prerelease: false
+          prerelease: true

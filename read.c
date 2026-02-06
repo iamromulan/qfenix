@@ -68,6 +68,7 @@ int read_op_load(const char *read_op_file, const char *incdir)
 		}
 
 		list_add(&read_ops, &read_op->node);
+		firehose_op_add_read(read_op);
 	}
 
 	xmlFreeDoc(doc);
@@ -128,6 +129,7 @@ int read_cmd_add(const char *address, const char *filename)
 	read_op->gpt_partition = gpt_partition;
 
 	list_add(&read_ops, &read_op->node);
+	firehose_op_add_read(read_op);
 
 	return 0;
 }

@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 
+#include "list.h"
 #include "patch.h"
 #include "program.h"
 #include "read.h"
@@ -126,5 +127,28 @@ int parse_storage_address(const char *address, int *physical_partition,
 
 extern bool qdl_debug;
 extern bool qdl_auto_edl;
+
+enum firehose_op_type {
+	OP_ERASE,
+	OP_PROGRAM,
+	OP_READ,
+};
+
+struct firehose_op {
+	enum firehose_op_type type;
+	union {
+		struct program *program;
+		struct read_op *read_op;
+	};
+	struct list_head node;
+};
+
+void firehose_op_add_program(struct program *program);
+void firehose_op_add_read(struct read_op *read_op);
+int firehose_op_execute(struct qdl_device *qdl,
+			int (*apply_erase)(struct qdl_device *, struct program *),
+			int (*apply_program)(struct qdl_device *, struct program *, int),
+			int (*apply_read)(struct qdl_device *, struct read_op *, int));
+void free_firehose_ops(void);
 
 #endif

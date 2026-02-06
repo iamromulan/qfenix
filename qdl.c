@@ -16,6 +16,7 @@
 #include <string.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "qdl.h"
@@ -420,6 +421,8 @@ struct firmware_files {
 	int rawprogram_count;
 	char **patch;
 	int patch_count;
+	char **rawread;
+	int rawread_count;
 	enum qdl_storage_type storage_type;
 	char *firehose_dir;
 };
@@ -442,17 +445,23 @@ static int match_file(const char *name, const char *prefix, const char *suffix)
 	return 1;
 }
 
-static char *find_file_in_dir(const char *dir, const char *prefix, const char *suffix)
+static char *find_file_recursive_impl(const char *dir, const char *prefix,
+				      const char *suffix, int depth)
 {
 	struct dirent *entry;
-	char *result = NULL;
 	char path[PATH_MAX];
+	char *result = NULL;
+	struct stat st;
 	DIR *d;
+
+	if (depth > 10)
+		return NULL;
 
 	d = opendir(dir);
 	if (!d)
 		return NULL;
 
+	/* First pass: check files in current directory */
 	while ((entry = readdir(d)) != NULL) {
 		if (entry->d_name[0] == '.')
 			continue;
@@ -464,42 +473,79 @@ static char *find_file_in_dir(const char *dir, const char *prefix, const char *s
 		}
 	}
 
+	/* Second pass: recurse into subdirectories */
+	if (!result) {
+		rewinddir(d);
+		while ((entry = readdir(d)) != NULL) {
+			if (entry->d_name[0] == '.')
+				continue;
+
+			snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+			if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+				result = find_file_recursive_impl(path, prefix, suffix, depth + 1);
+				if (result)
+					break;
+			}
+		}
+	}
+
 	closedir(d);
 	return result;
 }
 
-static int find_files_in_dir(const char *dir, const char *prefix, const char *suffix,
-			     char ***files_out, int *count_out)
+static char *find_file_recursive(const char *dir, const char *prefix, const char *suffix)
+{
+	return find_file_recursive_impl(dir, prefix, suffix, 0);
+}
+
+static int find_files_recursive_impl(const char *dir, const char *prefix,
+				      const char *suffix, char ***files_out,
+				      int *count_out, int *capacity, int depth)
 {
 	struct dirent *entry;
 	char path[PATH_MAX];
-	char **files = NULL;
-	int count = 0;
-	int capacity = 0;
+	struct stat st;
 	DIR *d;
+
+	if (depth > 10)
+		return 0;
 
 	d = opendir(dir);
 	if (!d)
-		return -1;
+		return 0;
 
 	while ((entry = readdir(d)) != NULL) {
 		if (entry->d_name[0] == '.')
 			continue;
 
+		snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+
 		if (match_file(entry->d_name, prefix, suffix)) {
-			if (count >= capacity) {
-				capacity = capacity ? capacity * 2 : 8;
-				files = realloc(files, capacity * sizeof(char *));
+			if (*count_out >= *capacity) {
+				*capacity = *capacity ? *capacity * 2 : 8;
+				*files_out = realloc(*files_out, *capacity * sizeof(char *));
 			}
-			snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
-			files[count++] = strdup(path);
+			(*files_out)[(*count_out)++] = strdup(path);
 		}
+
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+			find_files_recursive_impl(path, prefix, suffix,
+						  files_out, count_out, capacity, depth + 1);
 	}
 
 	closedir(d);
-	*files_out = files;
-	*count_out = count;
 	return 0;
+}
+
+static int find_files_recursive(const char *dir, const char *prefix, const char *suffix,
+				char ***files_out, int *count_out)
+{
+	int capacity = 0;
+
+	*files_out = NULL;
+	*count_out = 0;
+	return find_files_recursive_impl(dir, prefix, suffix,
+					 files_out, count_out, &capacity, 0);
 }
 
 static enum qdl_storage_type detect_storage_from_filename(const char *filename)
@@ -516,62 +562,67 @@ static enum qdl_storage_type detect_storage_from_filename(const char *filename)
 
 static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 {
-	char firehose_path[PATH_MAX];
-	char *dir;
+	char *dir_buf;
 	int i;
 
 	memset(fw, 0, sizeof(*fw));
 	fw->storage_type = QDL_STORAGE_UFS;
 
-	/* Check for update/firehose subdirectory */
-	snprintf(firehose_path, sizeof(firehose_path), "%s/update/firehose", base_dir);
-	if (access(firehose_path, R_OK) == 0) {
-		dir = firehose_path;
-	} else {
-		/* Use base directory directly */
-		dir = (char *)base_dir;
-	}
-	fw->firehose_dir = strdup(dir);
-
-	/* Find programmer file */
-	fw->programmer = find_file_in_dir(dir, "prog_firehose_", ".elf");
+	/* Find programmer file by searching recursively from base directory */
+	fw->programmer = find_file_recursive(base_dir, "prog_firehose_", ".elf");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_firehose_", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "prog_firehose_", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_nand_firehose_", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "prog_nand_firehose_", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_emmc_firehose_", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "prog_emmc_firehose_", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_ufs_firehose_", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "prog_ufs_firehose_", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "firehose-prog", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "firehose-prog", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_", ".mbn");
+		fw->programmer = find_file_recursive(base_dir, "prog_", ".mbn");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "prog_", ".elf");
+		fw->programmer = find_file_recursive(base_dir, "prog_", ".elf");
 	if (!fw->programmer)
-		fw->programmer = find_file_in_dir(dir, "xbl_s_devprg_", ".melf");
+		fw->programmer = find_file_recursive(base_dir, "xbl_s_devprg_", ".melf");
 
 	if (!fw->programmer) {
-		ux_err("no programmer file found in %s\n", dir);
+		ux_err("no programmer file found under %s\n", base_dir);
 		return -1;
 	}
 
-	/* Find rawprogram XML files */
-	find_files_in_dir(dir, "rawprogram", ".xml", &fw->rawprogram, &fw->rawprogram_count);
+	/*
+	 * Use the directory containing the programmer as the firehose
+	 * directory. Binary files referenced in XMLs are typically
+	 * co-located with the programmer.
+	 */
+	dir_buf = strdup(fw->programmer);
+	fw->firehose_dir = strdup(dirname(dir_buf));
+	free(dir_buf);
+
+	/* Find rawprogram XML files recursively */
+	find_files_recursive(base_dir, "rawprogram", ".xml",
+			     &fw->rawprogram, &fw->rawprogram_count);
 	if (fw->rawprogram_count == 0) {
-		ux_err("no rawprogram XML files found in %s\n", dir);
+		ux_err("no rawprogram XML files found under %s\n", base_dir);
 		return -1;
 	}
 
 	/* Detect storage type from first rawprogram filename */
 	fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
 
-	/* Find patch XML files */
-	find_files_in_dir(dir, "patch", ".xml", &fw->patch, &fw->patch_count);
+	/* Find patch XML files recursively */
+	find_files_recursive(base_dir, "patch", ".xml",
+			     &fw->patch, &fw->patch_count);
 
-	ux_info("Firmware directory: %s\n", dir);
+	/* Find rawread XML files recursively */
+	find_files_recursive(base_dir, "rawread", ".xml",
+			     &fw->rawread, &fw->rawread_count);
+
+	ux_info("Firmware directory: %s\n", base_dir);
 	ux_info("  Programmer: %s\n", fw->programmer);
+	ux_info("  Firehose dir: %s\n", fw->firehose_dir);
 	ux_info("  Storage type: %s\n",
 		fw->storage_type == QDL_STORAGE_NAND ? "nand" :
 		fw->storage_type == QDL_STORAGE_EMMC ? "emmc" :
@@ -582,6 +633,11 @@ static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 	ux_info("  Patch files: %d\n", fw->patch_count);
 	for (i = 0; i < fw->patch_count; i++)
 		ux_info("    %s\n", fw->patch[i]);
+	if (fw->rawread_count > 0) {
+		ux_info("  Read files: %d\n", fw->rawread_count);
+		for (i = 0; i < fw->rawread_count; i++)
+			ux_info("    %s\n", fw->rawread[i]);
+	}
 
 	return 0;
 }
@@ -600,6 +656,10 @@ static void firmware_free(struct firmware_files *fw)
 	for (i = 0; i < fw->patch_count; i++)
 		free(fw->patch[i]);
 	free(fw->patch);
+
+	for (i = 0; i < fw->rawread_count; i++)
+		free(fw->rawread[i]);
+	free(fw->rawread);
 }
 
 static void print_usage(FILE *out)
@@ -908,10 +968,14 @@ static int qdl_flash(int argc, char **argv)
 		if (ret < 0)
 			exit(1);
 
-		/* Load all rawprogram files */
+		/* Load all rawprogram files, using each XML's directory as incdir */
 		for (i = 0; i < fw.rawprogram_count; i++) {
+			char *xml_dir_buf = strdup(fw.rawprogram[i]);
+			char *xml_dir = dirname(xml_dir_buf);
+
 			ret = program_load(fw.rawprogram[i], storage_type == QDL_STORAGE_NAND,
-					   allow_missing, incdir);
+					   allow_missing, xml_dir);
+			free(xml_dir_buf);
 			if (ret < 0)
 				errx(1, "program_load %s failed", fw.rawprogram[i]);
 		}
@@ -921,6 +985,17 @@ static int qdl_flash(int argc, char **argv)
 			ret = patch_load(fw.patch[i]);
 			if (ret < 0)
 				errx(1, "patch_load %s failed", fw.patch[i]);
+		}
+
+		/* Load all rawread files */
+		for (i = 0; i < fw.rawread_count; i++) {
+			char *xml_dir_buf = strdup(fw.rawread[i]);
+			char *xml_dir = dirname(xml_dir_buf);
+
+			ret = read_op_load(fw.rawread[i], xml_dir);
+			free(xml_dir_buf);
+			if (ret < 0)
+				errx(1, "read_op_load %s failed", fw.rawread[i]);
 		}
 
 		if (!allow_fusing && program_is_sec_partition_flashed())
@@ -1015,6 +1090,7 @@ out_cleanup:
 		vip_gen_finalize(qdl);
 
 	qdl_close(qdl);
+	free_firehose_ops();
 	free_programs();
 	free_patches();
 
