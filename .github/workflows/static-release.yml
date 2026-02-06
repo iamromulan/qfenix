@@ -1,0 +1,383 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    tags:
+      - 'v*'
+  pull_request:
+
+jobs:
+  # Linux x64 - TRUE STATIC with Alpine/musl
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            build-base git bash pkgconf linux-headers \
+            libxml2-dev libxml2-static \
+            libusb-dev zlib-dev zlib-static \
+            xz-dev xz-static eudev-dev eudev-libs
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build static binary
+        run: |
+          make CFLAGS="-O2 -Wall -g -DBUILD_STATIC $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+               LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0) -ludev -lpthread -lm"
+          echo "=== Verify static ==="
+          file qfenix && ldd qfenix 2>&1 || true
+
+      - name: Run tests
+        run: make tests
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            qfenix
+            qfenix-ramdump
+            qfenix-ks
+
+  # Linux ARM64 - TRUE STATIC using QEMU emulation in Alpine ARM64 container
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build static ARM64 binary in Alpine container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:latest sh -c '
+              apk add --no-cache \
+                build-base git bash pkgconf linux-headers \
+                libxml2-dev libxml2-static \
+                libusb-dev zlib-dev zlib-static \
+                xz-dev xz-static eudev-dev eudev-libs
+
+              git config --global --add safe.directory /workspace
+
+              make CFLAGS="-O2 -Wall -g -DBUILD_STATIC $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+                   LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0) -ludev -lpthread -lm"
+
+              echo "=== Verify ARM64 static ==="
+              file qfenix
+            '
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: |
+            qfenix
+            qfenix-ramdump
+            qfenix-ks
+
+  # macOS ARM64 - Static third-party libs, dynamic system frameworks
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build static dependencies
+        run: |
+          PREFIX="$HOME/static-deps"
+          mkdir -p "$PREFIX"
+          NPROC=$(sysctl -n hw.ncpu)
+
+          # zlib
+          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          cd zlib-1.3.1
+          ./configure --static --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          # liblzma (from xz)
+          curl -sL https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.gz | tar xz
+          cd xz-5.6.3
+          ./configure --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          # libxml2
+          curl -sL https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.9.tar.xz | tar xJ
+          cd libxml2-2.12.9
+          ./configure --enable-static --disable-shared --without-python --prefix="$PREFIX" \
+            CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib"
+          make -j$NPROC && make install
+          cd ..
+
+          # libusb
+          curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 | tar xj
+          cd libusb-1.0.27
+          ./configure --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          echo "=== Static libraries ==="
+          ls -la "$PREFIX/lib/"*.a
+
+      - name: Build static
+        run: |
+          PREFIX="$HOME/static-deps"
+
+          # Create pkg-config wrapper that returns empty --libs
+          cat > /tmp/pkg-config-nolibs <<'SCRIPT'
+          #!/bin/bash
+          if echo "$*" | grep -q -- '--libs'; then
+            exit 0
+          fi
+          exec pkg-config "$@"
+          SCRIPT
+          chmod +x /tmp/pkg-config-nolibs
+
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          CFLAGS="-O2 -Wall -g $(pkg-config --cflags libxml-2.0 libusb-1.0)"
+          LDFLAGS="$PREFIX/lib/libxml2.a $PREFIX/lib/libusb-1.0.a $PREFIX/lib/liblzma.a $PREFIX/lib/libz.a -liconv -framework IOKit -framework CoreFoundation -framework Security"
+
+          echo "CFLAGS: $CFLAGS"
+          echo "LDFLAGS: $LDFLAGS"
+
+          make PKG_CONFIG=/tmp/pkg-config-nolibs \
+               CFLAGS="$CFLAGS" \
+               LDFLAGS="$LDFLAGS"
+
+          echo "=== Verify build ==="
+          file qfenix
+          echo "=== Dynamic dependencies (should only be system libs) ==="
+          otool -L qfenix
+
+      - name: Run tests
+        run: make tests
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: |
+            qfenix
+            qfenix-ramdump
+            qfenix-ks
+
+  # macOS x64 - Static third-party libs, dynamic system frameworks
+  build-macos-x64:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build static dependencies
+        run: |
+          PREFIX="$HOME/static-deps"
+          mkdir -p "$PREFIX"
+          NPROC=$(sysctl -n hw.ncpu)
+
+          # zlib
+          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          cd zlib-1.3.1
+          ./configure --static --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          # liblzma (from xz)
+          curl -sL https://github.com/tukaani-project/xz/releases/download/v5.6.3/xz-5.6.3.tar.gz | tar xz
+          cd xz-5.6.3
+          ./configure --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          # libxml2
+          curl -sL https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.9.tar.xz | tar xJ
+          cd libxml2-2.12.9
+          ./configure --enable-static --disable-shared --without-python --prefix="$PREFIX" \
+            CFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib"
+          make -j$NPROC && make install
+          cd ..
+
+          # libusb
+          curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 | tar xj
+          cd libusb-1.0.27
+          ./configure --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$NPROC && make install
+          cd ..
+
+          echo "=== Static libraries ==="
+          ls -la "$PREFIX/lib/"*.a
+
+      - name: Build static
+        run: |
+          PREFIX="$HOME/static-deps"
+
+          # Create pkg-config wrapper that returns empty --libs
+          cat > /tmp/pkg-config-nolibs <<'SCRIPT'
+          #!/bin/bash
+          if echo "$*" | grep -q -- '--libs'; then
+            exit 0
+          fi
+          exec pkg-config "$@"
+          SCRIPT
+          chmod +x /tmp/pkg-config-nolibs
+
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          CFLAGS="-O2 -Wall -g $(pkg-config --cflags libxml-2.0 libusb-1.0)"
+          LDFLAGS="$PREFIX/lib/libxml2.a $PREFIX/lib/libusb-1.0.a $PREFIX/lib/liblzma.a $PREFIX/lib/libz.a -liconv -framework IOKit -framework CoreFoundation -framework Security"
+
+          echo "CFLAGS: $CFLAGS"
+          echo "LDFLAGS: $LDFLAGS"
+
+          make PKG_CONFIG=/tmp/pkg-config-nolibs \
+               CFLAGS="$CFLAGS" \
+               LDFLAGS="$LDFLAGS"
+
+          echo "=== Verify build ==="
+          file qfenix
+          echo "=== Dynamic dependencies (should only be system libs) ==="
+          otool -L qfenix
+
+      - name: Run tests
+        run: make tests
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64
+          path: |
+            qfenix
+            qfenix-ramdump
+            qfenix-ks
+
+  # Windows x64 - True static build
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >
+            base-devel git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-xz
+            mingw-w64-x86_64-zlib
+
+      - name: Build static
+        shell: msys2 {0}
+        run: |
+          # Verify static libraries exist
+          echo "=== Checking for static libraries ==="
+          ls -la /mingw64/lib/libxml2.a /mingw64/lib/libusb-1.0.a /mingw64/lib/liblzma.a /mingw64/lib/libz.a /mingw64/lib/libiconv.a 2>&1 || true
+
+          # Hide DLL import libraries so linker must use static libs
+          echo "=== Hiding DLL import libraries ==="
+          for lib in libxml2 libusb-1.0 liblzma libz libiconv; do
+            if [ -f "/mingw64/lib/${lib}.dll.a" ]; then
+              mv "/mingw64/lib/${lib}.dll.a" "/mingw64/lib/${lib}.dll.a.bak"
+              echo "Hid ${lib}.dll.a"
+            fi
+          done
+
+          # Static defines tell headers not to use __declspec(dllimport)
+          STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
+
+          # Build with static flags
+          make CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+               LDFLAGS="-static -static-libgcc $(pkg-config --libs --static libxml-2.0 libusb-1.0) -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi"
+
+          echo "=== Verify static build ==="
+          file qfenix.exe
+          echo "=== DLL dependencies (should only show Windows system DLLs) ==="
+          objdump -p qfenix.exe | grep "DLL Name" || echo "No DLL dependencies"
+
+          # Restore DLL import libraries (for cleanliness)
+          for lib in libxml2 libusb-1.0 liblzma libz libiconv; do
+            if [ -f "/mingw64/lib/${lib}.dll.a.bak" ]; then
+              mv "/mingw64/lib/${lib}.dll.a.bak" "/mingw64/lib/${lib}.dll.a"
+            fi
+          done
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: make tests
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            qfenix.exe
+            qfenix-ramdump.exe
+            qfenix-ks.exe
+  create-release:
+    needs: [build-linux-x64, build-linux-arm64, build-macos-arm64, build-macos-x64, build-windows-x64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release archives
+        run: |
+          cd artifacts
+
+          for dir in linux-x64 linux-arm64 macos-arm64 macos-x64; do
+            cd $dir
+            chmod +x qfenix qfenix-ramdump qfenix-ks 2>/dev/null || true
+            tar -czvf ../qfenix-${dir}.tar.gz *
+            cd ..
+          done
+
+          cd windows-x64
+          zip -r ../qfenix-windows-x64.zip *
+          cd ..
+
+          ls -la *.tar.gz *.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/qfenix-linux-x64.tar.gz
+            artifacts/qfenix-linux-arm64.tar.gz
+            artifacts/qfenix-macos-arm64.tar.gz
+            artifacts/qfenix-macos-x64.tar.gz
+            artifacts/qfenix-windows-x64.zip
+          draft: false
+          prerelease: false
