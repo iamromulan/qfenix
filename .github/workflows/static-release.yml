@@ -524,9 +524,12 @@ jobs:
           SCRIPT
           chmod +x /tmp/pkg-config-nolibs
 
+          # Compile Windows admin manifest resource separately
+          # (Don't pass OS=Windows_NT to make - it breaks implicit rules on Linux)
+          aarch64-w64-mingw32-windres -i qfenix.rc -o manifest_res.o
+
           make CC=aarch64-w64-mingw32-gcc \
-               OS=Windows_NT \
-               WINDRES=aarch64-w64-mingw32-windres \
+               MANIFEST_OBJ=manifest_res.o \
                PKG_CONFIG=/tmp/pkg-config-nolibs \
                CFLAGS="$CFLAGS" \
                LDFLAGS="$LDFLAGS"
