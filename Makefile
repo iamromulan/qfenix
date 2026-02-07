@@ -12,14 +12,7 @@ prefix := /usr/local
 QDL_SRCS := firehose.c firehose_op.c io.c qdl.c sahara.c util.c patch.c program.c read.c sha2.c sim.c ufs.c usb.c ux.c oscompat.c vip.c sparse.c gpt.c diag_switch.c md5.c
 QDL_OBJS := $(QDL_SRCS:.c=.o)
 
-WINDRES ?= windres
-ifeq ($(OS),Windows_NT)
-MANIFEST_OBJ := manifest_res.o
-manifest_res.o: qfenix.rc qfenix.manifest
-	$(WINDRES) -i $< -o $@
-else
-MANIFEST_OBJ :=
-endif
+MANIFEST_OBJ ?=
 
 CHECKPATCH_SOURCES := $(shell find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.sh" \) ! -name "sha2.c" ! -name "sha2.h" ! -name "md5.c" ! -name "md5.h" ! -name "*version.h" ! -name "list.h")
 CHECKPATCH_ROOT := https://raw.githubusercontent.com/torvalds/linux/v6.15/scripts
@@ -47,7 +40,7 @@ util.o: version.h
 qdl.o: version.h
 
 clean:
-	rm -f $(QDL) $(QDL_OBJS) $(MANIFEST_OBJ)
+	rm -f $(QDL) $(QDL_OBJS) manifest_res.o
 	rm -f qfenix.1
 	rm -f compile_commands.json
 	rm -f version.h .version.h

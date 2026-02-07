@@ -342,8 +342,12 @@ jobs:
           # Static defines tell headers not to use __declspec(dllimport)
           STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
 
+          # Compile Windows admin manifest resource
+          windres -i qfenix.rc -o manifest_res.o
+
           # Build with static flags
-          make CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+          make MANIFEST_OBJ=manifest_res.o \
+               CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
                LDFLAGS="-static -static-libgcc $(pkg-config --libs --static libxml-2.0 libusb-1.0) -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi"
 
           echo "=== Verify static build ==="
@@ -417,8 +421,12 @@ jobs:
           # Static defines tell headers not to use __declspec(dllimport)
           STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
 
+          # Compile Windows admin manifest resource
+          windres -i qfenix.rc -o manifest_res.o
+
           # Build with static flags
-          make CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
+          make MANIFEST_OBJ=manifest_res.o \
+               CFLAGS="-O2 -Wall -g $STATIC_DEFINES $(pkg-config --cflags libxml-2.0 libusb-1.0)" \
                LDFLAGS="-static -static-libgcc $(pkg-config --libs --static libxml-2.0 libusb-1.0) -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi"
 
           echo "=== Verify static build ==="
