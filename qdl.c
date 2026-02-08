@@ -2765,6 +2765,21 @@ static int qdl_flash(int argc, char **argv)
 		}
 	} else {
 		ret = qdl_open(qdl, serial);
+#ifdef _WIN32
+		if (ret == -2) {
+			/*
+			 * USB driver not WinUSB-compatible (e.g. QDLoader).
+			 * Fall back to COM port transport.
+			 */
+			qdl_deinit(qdl);
+			qdl = qdl_init(QDL_DEVICE_PCIE);
+			if (!qdl) {
+				ret = 1;
+				goto out_cleanup;
+			}
+			ret = qdl_open(qdl, serial);
+		}
+#endif
 		if (ret)
 			goto out_cleanup;
 

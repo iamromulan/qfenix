@@ -137,6 +137,8 @@ static xmlNode *firehose_response_parse(const void *buf, size_t len, int *error)
 	if (!node) {
 		ux_err("empty firehose response\n");
 		*error = -EINVAL;
+		xmlFreeDoc(doc);
+		return NULL;
 	}
 
 	return node;
@@ -283,12 +285,13 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 			/*
 			 * Truncate at </data> to separate XML from any
 			 * trailing binary data (e.g. rawmode payload).
-			 * strstr is safe here because XML text precedes
-			 * any binary data and contains no null bytes.
+			 * Use find_in_mem for null-safety and to stay
+			 * within fragment bounds.
 			 */
-			data_end = strstr(frag, "</data>");
+			data_end = find_in_mem(frag, frag_len,
+					       "</data>", 7);
 			xml_len = frag_len;
-			if (data_end && (size_t)(data_end - frag + 7) <= frag_len)
+			if (data_end)
 				xml_len = (size_t)(data_end - frag) + 7;
 
 			node = firehose_response_parse(frag, xml_len, &error);
@@ -842,6 +845,8 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 				     wanted - got, 30000);
 			if (n < 0)
 				err(1, "failed to read");
+			if (n == 0)
+				err(1, "unexpected EOF during raw read");
 			got += (size_t)n;
 		}
 		n = (int)got;
