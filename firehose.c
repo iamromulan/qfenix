@@ -180,15 +180,33 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 
 		ux_debug("FIREHOSE READ: %s\n", buf);
 
-		node = firehose_response_parse(buf, n, &error);
-		if (!node)
-			return error;
+		/*
+		 * COM port transport may deliver multiple XML documents
+		 * in a single read (serial is a byte stream, unlike USB
+		 * where each bulk transfer is a separate message).
+		 * Split on "<?xml" boundaries and parse each fragment.
+		 */
+		char *frag = buf;
 
-		ret = response_parser(node, data, &rawmode);
-		xmlFreeDoc(node->doc);
+		while (frag && *frag) {
+			char *next_xml = strstr(frag + 1, "<?xml");
+			size_t frag_len = next_xml ? (size_t)(next_xml - frag)
+						   : strlen(frag);
 
-		if (ret >= 0)
-			resp = ret;
+			node = firehose_response_parse(frag, frag_len, &error);
+			if (node) {
+				ret = response_parser(node, data, &rawmode);
+				xmlFreeDoc(node->doc);
+
+				if (ret >= 0)
+					resp = ret;
+			}
+
+			if (rawmode)
+				break;
+
+			frag = next_xml;
+		}
 
 		if (rawmode)
 			break;
