@@ -703,6 +703,135 @@ int gpt_set_active_slot(struct qdl_device *qdl, char slot)
 	return -1;
 }
 
+static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
+{
+	struct smem_flash_ptable ptable;
+	struct storage_info sinfo;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	unsigned int pages_per_block;
+	char sector_str[16];
+	char filepath[4096];
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	int mibib_sector;
+	unsigned int i;
+	int ret;
+	int count = 0;
+	int failed = 0;
+
+	/* Detect NAND page/sector size */
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	/* Find MIBIB block */
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	/* Read partition table (page after MBN header) */
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	/* Parse SMEM header */
+	memcpy(&ptable, buf, sizeof(ptable));
+
+	if (ptable.magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable.magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic\n");
+		return -1;
+	}
+
+	if (ptable.version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable.numparts > max_parts) {
+		ux_err("SMEM partition table has %u entries (max %u)\n",
+		       ptable.numparts, max_parts);
+		return -1;
+	}
+
+	/* Get block size from storage info for erase-block-to-page conversion */
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size) {
+		ux_err("failed to get NAND block size from storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	if (!pages_per_block) {
+		ux_err("invalid block_size/page_size ratio\n");
+		return -1;
+	}
+
+	/* Create output directory if needed */
+#ifdef _WIN32
+	ret = mkdir(outdir);
+#else
+	ret = mkdir(outdir, 0755);
+#endif
+	if (ret < 0 && errno != EEXIST) {
+		ux_err("failed to create output directory %s: %s\n",
+		       outdir, strerror(errno));
+		return -1;
+	}
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+		unsigned int start_pages = e->offset * pages_per_block;
+		unsigned int num_pages = e->length * pages_per_block;
+
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		/* Strip "0:" prefix if present */
+		const char *display_name = name;
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		snprintf(filepath, sizeof(filepath), "%s/%s.bin",
+			 outdir, display_name);
+
+		ux_info("reading partition '%s' (%u pages) to %s\n",
+			display_name, num_pages, filepath);
+
+		ret = firehose_read_to_file(qdl, 0, start_pages,
+					    num_pages, sector_size, filepath);
+		if (ret < 0) {
+			ux_err("failed to read partition '%s'\n", display_name);
+			failed++;
+		} else {
+			count++;
+		}
+	}
+
+	ux_info("read %d partitions (%d failed) to %s\n",
+		count, failed, outdir);
+	return failed ? -1 : 0;
+}
+
 int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 {
 	struct gpt_partition *part;
@@ -710,6 +839,9 @@ int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 	int ret;
 	int count = 0;
 	int failed = 0;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_read_all_partitions(qdl, outdir);
 
 	ret = gpt_load_tables(qdl);
 	if (ret < 0)
@@ -749,4 +881,265 @@ int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 	ux_info("read %d partitions (%d failed) to %s\n",
 		count, failed, outdir);
 	return failed ? -1 : 0;
+}
+
+static const char *storage_type_str(enum qdl_storage_type t)
+{
+	switch (t) {
+	case QDL_STORAGE_NAND:  return "nand";
+	case QDL_STORAGE_EMMC:  return "emmc";
+	case QDL_STORAGE_UFS:   return "ufs";
+	case QDL_STORAGE_NVME:  return "nvme";
+	case QDL_STORAGE_SPINOR: return "spinor";
+	default:                return "unknown";
+	}
+}
+
+static int nand_make_xml(struct qdl_device *qdl, const char *outdir,
+			 bool make_read, bool make_program)
+{
+	struct smem_flash_ptable ptable;
+	struct storage_info sinfo;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	unsigned int pages_per_block;
+	char sector_str[16];
+	char filepath[4096];
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	int mibib_sector;
+	unsigned int i;
+	FILE *fp;
+	int ret;
+
+	/* Detect NAND page/sector size */
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	/* Find MIBIB block */
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	/* Read partition table */
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	memcpy(&ptable, buf, sizeof(ptable));
+
+	if (ptable.magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable.magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic\n");
+		return -1;
+	}
+
+	if (ptable.version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable.numparts > max_parts)
+		ptable.numparts = max_parts;
+
+	/* Get block size for conversion */
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size) {
+		ux_err("failed to get NAND block size from storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	if (!pages_per_block) {
+		ux_err("invalid block_size/page_size ratio\n");
+		return -1;
+	}
+
+	if (make_read) {
+		snprintf(filepath, sizeof(filepath), "%s/rawread_nand.xml", outdir);
+		fp = fopen(filepath, "w");
+		if (!fp) {
+			ux_err("failed to create %s: %s\n", filepath, strerror(errno));
+			return -1;
+		}
+
+		fprintf(fp, "<?xml version=\"1.0\" ?>\n");
+		fprintf(fp, "<data>\n");
+		fprintf(fp, "  <!-- Generated by qfenix from device partition table -->\n");
+
+		for (i = 0; i < ptable.numparts; i++) {
+			struct smem_flash_pentry *e = &ptable.pentry[i];
+			unsigned int start_pages = e->offset * pages_per_block;
+			unsigned int num_pages = e->length * pages_per_block;
+
+			memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+			name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+			const char *dname = name;
+			if (name[0] == '0' && name[1] == ':')
+				dname = name + 2;
+
+			fprintf(fp, "  <read PAGES_PER_BLOCK=\"%u\" SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" filename=\"%s.bin\" label=\"%s\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"0\""
+				" start_sector=\"%u\"/>\n",
+				pages_per_block, sector_size, dname, dname,
+				num_pages, start_pages);
+		}
+
+		fprintf(fp, "</data>\n");
+		fclose(fp);
+		ux_info("wrote %s (%u partitions)\n", filepath, ptable.numparts);
+	}
+
+	if (make_program) {
+		snprintf(filepath, sizeof(filepath), "%s/rawprogram_nand.xml", outdir);
+		fp = fopen(filepath, "w");
+		if (!fp) {
+			ux_err("failed to create %s: %s\n", filepath, strerror(errno));
+			return -1;
+		}
+
+		fprintf(fp, "<?xml version=\"1.0\" ?>\n");
+		fprintf(fp, "<data>\n");
+		fprintf(fp, "  <!-- Generated by qfenix from device partition table -->\n");
+
+		for (i = 0; i < ptable.numparts; i++) {
+			struct smem_flash_pentry *e = &ptable.pentry[i];
+			unsigned int start_pages = e->offset * pages_per_block;
+			unsigned int num_pages = e->length * pages_per_block;
+
+			memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+			name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+			const char *dname = name;
+			if (name[0] == '0' && name[1] == ':')
+				dname = name + 2;
+
+			fprintf(fp, "  <erase PAGES_PER_BLOCK=\"%u\" SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"0\""
+				" start_sector=\"%u\"/>\n",
+				pages_per_block, sector_size, num_pages, start_pages);
+			fprintf(fp, "  <program PAGES_PER_BLOCK=\"%u\" SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" filename=\"%s.bin\" label=\"%s\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"0\""
+				" start_sector=\"%u\"/>\n",
+				pages_per_block, sector_size, dname, dname,
+				num_pages, start_pages);
+		}
+
+		fprintf(fp, "</data>\n");
+		fclose(fp);
+		ux_info("wrote %s (%u partitions)\n", filepath, ptable.numparts);
+	}
+
+	return 0;
+}
+
+static int gpt_make_xml_from_table(struct qdl_device *qdl, const char *outdir,
+				   bool make_read, bool make_program)
+{
+	struct gpt_partition *part;
+	char filepath[4096];
+	const char *stype;
+	FILE *fp;
+	int ret;
+	int count = 0;
+
+	ret = gpt_load_tables(qdl);
+	if (ret < 0)
+		return -1;
+
+	stype = storage_type_str(qdl->storage_type);
+
+	if (make_read) {
+		snprintf(filepath, sizeof(filepath), "%s/rawread_%s.xml", outdir, stype);
+		fp = fopen(filepath, "w");
+		if (!fp) {
+			ux_err("failed to create %s: %s\n", filepath, strerror(errno));
+			return -1;
+		}
+
+		fprintf(fp, "<?xml version=\"1.0\" ?>\n");
+		fprintf(fp, "<data>\n");
+		fprintf(fp, "  <!-- Generated by qfenix from device partition table -->\n");
+
+		count = 0;
+		for (part = gpt_partitions; part; part = part->next) {
+			fprintf(fp, "  <read SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" filename=\"lun%u_%s.bin\" label=\"%s\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"%u\""
+				" start_sector=\"%u\"/>\n",
+				qdl->sector_size, part->partition, part->name,
+				part->name, part->num_sectors, part->partition,
+				part->start_sector);
+			count++;
+		}
+
+		fprintf(fp, "</data>\n");
+		fclose(fp);
+		ux_info("wrote %s (%d partitions)\n", filepath, count);
+	}
+
+	if (make_program) {
+		snprintf(filepath, sizeof(filepath), "%s/rawprogram_%s.xml", outdir, stype);
+		fp = fopen(filepath, "w");
+		if (!fp) {
+			ux_err("failed to create %s: %s\n", filepath, strerror(errno));
+			return -1;
+		}
+
+		fprintf(fp, "<?xml version=\"1.0\" ?>\n");
+		fprintf(fp, "<data>\n");
+		fprintf(fp, "  <!-- Generated by qfenix from device partition table -->\n");
+
+		count = 0;
+		for (part = gpt_partitions; part; part = part->next) {
+			fprintf(fp, "  <erase SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"%u\""
+				" start_sector=\"%u\"/>\n",
+				qdl->sector_size, part->num_sectors,
+				part->partition, part->start_sector);
+			fprintf(fp, "  <program SECTOR_SIZE_IN_BYTES=\"%zu\""
+				" filename=\"lun%u_%s.bin\" label=\"%s\""
+				" num_partition_sectors=\"%u\" physical_partition_number=\"%u\""
+				" start_sector=\"%u\"/>\n",
+				qdl->sector_size, part->partition, part->name,
+				part->name, part->num_sectors, part->partition,
+				part->start_sector);
+			count++;
+		}
+
+		fprintf(fp, "</data>\n");
+		fclose(fp);
+		ux_info("wrote %s (%d partitions)\n", filepath, count);
+	}
+
+	return 0;
+}
+
+int gpt_make_xml(struct qdl_device *qdl, const char *outdir,
+		 bool make_read, bool make_program)
+{
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_make_xml(qdl, outdir, make_read, make_program);
+
+	return gpt_make_xml_from_table(qdl, outdir, make_read, make_program);
 }
