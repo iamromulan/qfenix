@@ -596,16 +596,12 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 		if (wait == WAIT_TIMEOUT) {
 			CancelIo(pcie->hSerial);
 			GetOverlappedResult(pcie->hSerial, &ov, &n, TRUE);
-			if (n == 0)
-				goto out;
-		} else if (wait != WAIT_OBJECT_0) {
+		} else if (wait == WAIT_OBJECT_0) {
+			GetOverlappedResult(pcie->hSerial, &ov, &n, FALSE);
+		} else {
 			CancelIo(pcie->hSerial);
 			goto out;
 		}
-
-		if (!GetOverlappedResult(pcie->hSerial, &ov, &n, FALSE) &&
-		    n == 0)
-			goto out;
 	}
 
 	ret = (n > 0) ? (int)n : -1;
