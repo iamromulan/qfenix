@@ -1,5 +1,5 @@
 QDL := qfenix
-VERSION := $(or $(VERSION), $(shell git describe --dirty --always --tags 2>/dev/null), "unknown-version")
+VERSION := $(or $(VERSION), $(shell git update-index -q --refresh 2>/dev/null; git describe --dirty --always --tags 2>/dev/null), "unknown-version")
 
 PKG_CONFIG ?= pkg-config
 CFLAGS += -O2 -Wall -g `$(PKG_CONFIG) --cflags libxml-2.0 libusb-1.0`
