@@ -135,7 +135,8 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 
 		ret = libusb_open(dev, &handle);
 		if (ret < 0) {
-			warnx("unable to open USB device");
+			warnx("unable to open USB device: %s",
+			      libusb_strerror(ret));
 			continue;
 		}
 
@@ -280,7 +281,8 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 
 		ret = libusb_open(dev, &handle);
 		if (ret < 0) {
-			warnx("unable to open USB device");
+			warnx("unable to open USB device: %s",
+			      libusb_strerror(ret));
 			continue;
 		}
 
