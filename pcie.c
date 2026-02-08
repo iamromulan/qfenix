@@ -506,6 +506,7 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	char portPath[48];
 	HANDLE hSerial;
 	DCB dcb = {0};
+	COMMTIMEOUTS timeouts = {0};
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
 
@@ -523,15 +524,8 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	ux_info("opening EDL port %s\n", port);
 	snprintf(portPath, sizeof(portPath), "\\\\.\\%s", port);
 
-	/*
-	 * Open with FILE_FLAG_OVERLAPPED so we can enforce our own
-	 * timeouts via WaitForSingleObject.  Some USB serial drivers
-	 * (e.g. Qualcomm QDLoader 9008) ignore COMMTIMEOUTS and block
-	 * ReadFile indefinitely in synchronous mode.
-	 */
 	hSerial = CreateFileA(portPath, GENERIC_READ | GENERIC_WRITE,
-			      0, NULL, OPEN_EXISTING,
-			      FILE_FLAG_OVERLAPPED, NULL);
+			      0, NULL, OPEN_EXISTING, 0, NULL);
 	if (hSerial == INVALID_HANDLE_VALUE) {
 		ux_err("cannot open %s (error %lu)\n", port, GetLastError());
 		return -1;
@@ -562,6 +556,24 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	}
 
 	/*
+	 * Use non-blocking reads (return immediately with available
+	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008)
+	 * ignore ReadTotalTimeoutConstant and block ReadFile
+	 * indefinitely.  Timeouts are enforced in pcie_read_win()
+	 * via a polling loop instead.  This matches Qflash's approach.
+	 */
+	timeouts.ReadIntervalTimeout = MAXDWORD;
+	timeouts.ReadTotalTimeoutMultiplier = 0;
+	timeouts.ReadTotalTimeoutConstant = 0;
+	timeouts.WriteTotalTimeoutConstant = 5000;
+	timeouts.WriteTotalTimeoutMultiplier = 0;
+
+	if (!SetCommTimeouts(hSerial, &timeouts)) {
+		CloseHandle(hSerial);
+		return -1;
+	}
+
+	/*
 	 * Only purge TX — preserve any Sahara hello the device already
 	 * sent while we were waiting for the COM port to appear.
 	 */
@@ -569,10 +581,6 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 
 	pcie->hSerial = hSerial;
 	ux_info("EDL port %s opened\n", port);
-
-	/* Let the device finish initializing and send the Sahara hello */
-	Sleep(1000);
-
 	return 0;
 }
 
@@ -580,80 +588,45 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 			 unsigned int timeout)
 {
 	struct qdl_device_pcie_win *pcie;
-	OVERLAPPED ov = {0};
+	DWORD deadline;
 	DWORD n = 0;
-	DWORD wait;
-	int ret = -1;
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
+	deadline = GetTickCount() + (timeout ? timeout : 5000);
 
-	ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-	if (!ov.hEvent)
-		return -1;
+	/*
+	 * Poll with non-blocking ReadFile until data arrives or
+	 * the timeout expires.  COMMTIMEOUTS is configured for
+	 * immediate return so this works even with drivers that
+	 * ignore ReadTotalTimeoutConstant.
+	 */
+	do {
+		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
+			return -1;
 
-	if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, &ov)) {
-		if (GetLastError() != ERROR_IO_PENDING)
-			goto out;
+		if (n > 0)
+			return (int)n;
 
-		wait = WaitForSingleObject(ov.hEvent,
-					   timeout ? timeout : 5000);
-		if (wait == WAIT_TIMEOUT) {
-			CancelIo(pcie->hSerial);
-			GetOverlappedResult(pcie->hSerial, &ov, &n, TRUE);
-			if (n == 0)
-				goto out;
-		} else if (wait != WAIT_OBJECT_0) {
-			CancelIo(pcie->hSerial);
-			goto out;
-		}
+		Sleep(10);
+	} while (GetTickCount() < deadline);
 
-		if (!GetOverlappedResult(pcie->hSerial, &ov, &n, FALSE) &&
-		    n == 0)
-			goto out;
-	}
-
-	ret = (n > 0) ? (int)n : -1;
-
-out:
-	CloseHandle(ov.hEvent);
-	return ret;
+	return -1;
 }
 
 static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
 			  unsigned int timeout)
 {
 	struct qdl_device_pcie_win *pcie;
-	OVERLAPPED ov = {0};
 	DWORD written = 0;
-	DWORD wait;
-	int ret = -1;
+
+	(void)timeout;
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
 
-	ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-	if (!ov.hEvent)
+	if (!WriteFile(pcie->hSerial, buf, (DWORD)len, &written, NULL))
 		return -1;
 
-	if (!WriteFile(pcie->hSerial, buf, (DWORD)len, &written, &ov)) {
-		if (GetLastError() != ERROR_IO_PENDING)
-			goto out;
-
-		wait = WaitForSingleObject(ov.hEvent,
-					   timeout ? timeout : 5000);
-		if (wait != WAIT_OBJECT_0) {
-			CancelIo(pcie->hSerial);
-			goto out;
-		}
-
-		if (!GetOverlappedResult(pcie->hSerial, &ov, &written, FALSE))
-			goto out;
-	}
-
-	ret = (int)written;
-
-out:
-	CloseHandle(ov.hEvent);
-	return ret;
+	return (int)written;
 }
 
 static void pcie_close_win(struct qdl_device *qdl)

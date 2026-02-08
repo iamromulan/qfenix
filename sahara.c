@@ -487,13 +487,13 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 
 			/*
 			 * On COM port transport (Windows QDLoader/PCIe),
-			 * the initial Sahara hello may have been lost if
-			 * it was sent before the port was opened.  Send
-			 * a reset command after several failures to make
-			 * the device resend it.  Don't send resets too
-			 * early — the hello may still be in transit.
+			 * the initial Sahara hello is almost always lost
+			 * (sent before the port was opened).  Send a
+			 * reset quickly to trigger a fresh hello before
+			 * the PBL times out (typically 2-5 seconds).
 			 */
-			if (!done && retries == 10)
+			if (!done && (retries == 13 || retries == 9 ||
+				      retries == 5))
 				sahara_send_reset(qdl);
 		} while (--retries > 0);
 
