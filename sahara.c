@@ -462,9 +462,19 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 
 	while (!done) {
 		int retries = 5;
+		bool reset_sent = false;
 
 		do {
 			n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+			/*
+			 * On COM port transport (Windows QDLoader/PCIe),
+			 * the Sahara hello may have been lost — send a
+			 * reset command to make the device resend it.
+			 */
+			if (n < 0 && !done && !reset_sent && retries <= 3) {
+				sahara_send_reset(qdl);
+				reset_sent = true;
+			}
 		} while (n < 0 && --retries > 0);
 
 		if (n < 0) {

@@ -567,7 +567,11 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		return -1;
 	}
 
-	PurgeComm(hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
+	/*
+	 * Only purge TX — preserve any Sahara hello the device already
+	 * sent while we were waiting for the COM port to appear.
+	 */
+	PurgeComm(hSerial, PURGE_TXCLEAR);
 
 	pcie->hSerial = hSerial;
 	ux_info("EDL port %s opened\n", port);

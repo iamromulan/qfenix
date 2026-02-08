@@ -1551,6 +1551,21 @@ static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
 	} else {
 		/* USB: standard Sahara handshake */
 		ret = qdl_open(qdl, serial);
+#ifdef _WIN32
+		if (ret == -2) {
+			/*
+			 * USB driver not WinUSB-compatible (e.g. QDLoader).
+			 * Fall back to COM port transport — the QDLoader
+			 * driver exposes the same Sahara/Firehose protocol
+			 * over a serial port.
+			 */
+			qdl_deinit(qdl);
+			qdl = qdl_init(QDL_DEVICE_PCIE);
+			if (!qdl)
+				return -1;
+			ret = qdl_open(qdl, serial);
+		}
+#endif
 		if (ret) {
 			qdl_deinit(qdl);
 			return -1;

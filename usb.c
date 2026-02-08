@@ -135,6 +135,16 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 
 		ret = libusb_open(dev, &handle);
 		if (ret < 0) {
+#ifdef _WIN32
+			/*
+			 * NOT_SUPPORTED means no WinUSB driver (e.g.
+			 * QDLoader driver is installed instead).
+			 */
+			if (ret == LIBUSB_ERROR_NOT_SUPPORTED) {
+				libusb_free_config_descriptor(config);
+				return -2;
+			}
+#endif
 			warnx("unable to open USB device: %s",
 			      libusb_strerror(ret));
 			continue;
@@ -189,12 +199,18 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 	ssize_t n;
 	int ret;
 	int i;
+#ifdef _WIN32
+	int not_supported_scans = 0;
+#endif
 
 	ret = libusb_init(NULL);
 	if (ret < 0)
 		err(1, "failed to initialize libusb");
 
 	for (;;) {
+#ifdef _WIN32
+		bool scan_not_supported = false;
+#endif
 		n = libusb_get_device_list(NULL, &devs);
 		if (n < 0)
 			err(1, "failed to list USB devices");
@@ -207,12 +223,33 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 				found = true;
 				break;
 			}
+#ifdef _WIN32
+			if (ret == -2)
+				scan_not_supported = true;
+#endif
 		}
 
 		libusb_free_device_list(devs, 1);
 
 		if (found)
 			return 0;
+
+#ifdef _WIN32
+		/*
+		 * EDL device found but the USB driver is not WinUSB-
+		 * compatible (e.g. Qualcomm QDLoader 9008 driver).
+		 * Signal the caller to fall back to COM port transport.
+		 */
+		if (scan_not_supported) {
+			if (++not_supported_scans >= 3) {
+				ux_info("USB driver not WinUSB-compatible, trying COM port...\n");
+				libusb_exit(NULL);
+				return -2;
+			}
+		} else {
+			not_supported_scans = 0;
+		}
+#endif
 
 		/* Try DIAG-to-EDL switch if enabled and not yet attempted */
 		if (qdl_auto_edl && !diag_attempted) {
