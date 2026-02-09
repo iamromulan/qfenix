@@ -539,13 +539,20 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		return -1;
 	}
 
+	/*
+	 * Set large receive/transmit buffers to prevent data loss.
+	 * The default 4KB receive buffer can overflow when the device
+	 * sends raw data at USB speed between our polling reads.
+	 */
+	SetupComm(hSerial, 1048576, 1048576);
+
 	dcb.DCBlength = sizeof(dcb);
 	if (!GetCommState(hSerial, &dcb)) {
 		CloseHandle(hSerial);
 		return -1;
 	}
 
-	dcb.BaudRate = CBR_115200;
+	dcb.BaudRate = 921600;
 	dcb.ByteSize = 8;
 	dcb.StopBits = ONESTOPBIT;
 	dcb.Parity = NOPARITY;
