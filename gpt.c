@@ -818,7 +818,8 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 			display_name, num_pages, filepath);
 
 		ret = firehose_read_to_file(qdl, 0, start_pages,
-					    num_pages, sector_size, filepath);
+					    num_pages, sector_size,
+					    pages_per_block, filepath);
 		if (ret < 0) {
 			ux_err("failed to read partition '%s'\n", display_name);
 			failed++;
@@ -869,7 +870,7 @@ int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 		ret = firehose_read_to_file(qdl, part->partition,
 					    part->start_sector,
 					    part->num_sectors,
-					    qdl->sector_size, filepath);
+					    qdl->sector_size, 0, filepath);
 		if (ret < 0) {
 			ux_err("failed to read partition '%s'\n", part->name);
 			failed++;

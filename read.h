@@ -11,6 +11,7 @@ struct qdl_device;
 
 struct read_op {
 	unsigned int sector_size;
+	unsigned int pages_per_block;
 	const char *filename;
 	int partition;
 	unsigned int num_sectors;

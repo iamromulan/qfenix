@@ -113,7 +113,8 @@ int firehose_detect_and_configure(struct qdl_device *qdl,
 int firehose_power(struct qdl_device *qdl, const char *mode, int delay);
 int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 			  unsigned int start_sector, unsigned int num_sectors,
-			  unsigned int sector_size, const char *filename);
+			  unsigned int sector_size, unsigned int pages_per_block,
+			  const char *filename);
 
 struct storage_info {
 	unsigned long total_blocks;

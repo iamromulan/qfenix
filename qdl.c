@@ -660,21 +660,25 @@ static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 	/* Find rawprogram XML files recursively */
 	find_files_recursive(base_dir, "rawprogram", ".xml",
 			     &fw->rawprogram, &fw->rawprogram_count);
-	if (fw->rawprogram_count == 0) {
-		ux_err("no rawprogram XML files found under %s\n", base_dir);
-		return -1;
-	}
-
-	/* Detect storage type from first rawprogram filename */
-	fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
-
-	/* Find patch XML files recursively */
-	find_files_recursive(base_dir, "patch", ".xml",
-			     &fw->patch, &fw->patch_count);
 
 	/* Find rawread XML files recursively */
 	find_files_recursive(base_dir, "rawread", ".xml",
 			     &fw->rawread, &fw->rawread_count);
+
+	if (fw->rawprogram_count == 0 && fw->rawread_count == 0) {
+		ux_err("no rawprogram or rawread XML files found under %s\n", base_dir);
+		return -1;
+	}
+
+	/* Detect storage type from first rawprogram or rawread filename */
+	if (fw->rawprogram_count > 0)
+		fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
+	else
+		fw->storage_type = detect_storage_from_filename(fw->rawread[0]);
+
+	/* Find patch XML files recursively */
+	find_files_recursive(base_dir, "patch", ".xml",
+			     &fw->patch, &fw->patch_count);
 
 	ux_info("Firmware directory: %s\n", base_dir);
 	ux_info("  Programmer: %s\n", fw->programmer);

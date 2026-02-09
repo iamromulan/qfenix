@@ -805,6 +805,8 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
+	if (read_op->pages_per_block)
+		xml_setpropf(node, "PAGES_PER_BLOCK", "%d", read_op->pages_per_block);
 	if (read_op->filename)
 		xml_setpropf(node, "filename", "%s", read_op->filename);
 
@@ -843,10 +845,21 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 		while (got < wanted) {
 			n = qdl_read(qdl, (char *)buf + got,
 				     wanted - got, 30000);
-			if (n < 0)
-				err(1, "failed to read");
-			if (n == 0)
-				err(1, "unexpected EOF during raw read");
+			if (n < 0) {
+				ux_err("raw read failed (error %d) at %.1f%% of %s\n",
+				       n,
+				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
+				       read_op->filename ? read_op->filename : "?");
+				ret = -1;
+				goto drain;
+			}
+			if (n == 0) {
+				ux_err("unexpected EOF at %.1f%% of %s\n",
+				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
+				       read_op->filename ? read_op->filename : "?");
+				ret = -1;
+				goto drain;
+			}
 			got += (size_t)n;
 		}
 		n = (int)got;
@@ -871,9 +884,27 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 			ux_progress("%s", read_op->num_sectors - left, read_op->num_sectors, read_op->filename);
 	}
 
-	ret = firehose_read(qdl, 10000, firehose_generic_parser, NULL);
+drain:
+	/*
+	 * Drain remaining rawmode data and the closing ACK so the
+	 * stream is re-synchronised for subsequent commands.
+	 * On failure (mid-read error) discard whatever remains;
+	 * on success this consumes the normal rawmode=false ACK.
+	 */
+	fh_remainder_len = 0;
 	if (ret) {
-		ux_err("read operation failed\n");
+		int drain_n;
+
+		do {
+			drain_n = qdl_read(qdl, buf,
+					   qdl->max_payload_size, 2000);
+		} while (drain_n > 0);
+	}
+
+	if (firehose_read(qdl, 10000, firehose_generic_parser, NULL)) {
+		if (!ret)
+			ux_err("read operation failed\n");
+		ret = -1;
 		goto out;
 	}
 
@@ -1319,7 +1350,8 @@ int firehose_getstorageinfo(struct qdl_device *qdl,
 
 int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 			  unsigned int start_sector, unsigned int num_sectors,
-			  unsigned int sector_size, const char *filename)
+			  unsigned int sector_size, unsigned int pages_per_block,
+			  const char *filename)
 {
 	struct read_op op;
 	char start_str[32];
@@ -1330,6 +1362,7 @@ int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 
 	memset(&op, 0, sizeof(op));
 	op.sector_size = sector_size;
+	op.pages_per_block = pages_per_block;
 	op.start_sector = start_str;
 	op.num_sectors = num_sectors;
 	op.partition = partition;

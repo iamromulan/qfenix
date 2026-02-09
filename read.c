@@ -33,6 +33,15 @@ int read_op_load_tag(xmlNode *node, const char *incdir)
 	read_op->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
 	read_op->start_sector = attr_as_string(node, "start_sector", &errors);
 
+	/* PAGES_PER_BLOCK is optional (only present on NAND) */
+	{
+		xmlChar *ppb = xmlGetProp(node, (xmlChar *)"PAGES_PER_BLOCK");
+		if (ppb) {
+			read_op->pages_per_block = attr_as_unsigned(node, "PAGES_PER_BLOCK", &errors);
+			xmlFree(ppb);
+		}
+	}
+
 	if (errors) {
 		free(read_op);
 		return -EINVAL;
