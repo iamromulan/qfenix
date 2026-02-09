@@ -571,15 +571,14 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	}
 
 	/*
-	 * Use non-blocking reads (return immediately with available
-	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008)
-	 * ignore ReadTotalTimeoutConstant and block ReadFile
-	 * indefinitely.  Timeouts are enforced in pcie_read_win()
-	 * via a polling loop instead.  This matches Qflash's approach.
+	 * Default timeouts — pcie_read_win() overrides per-call
+	 * using the MAXDWORD/MAXDWORD/timeout special case for
+	 * blocking reads.  Set a 5s default here for any reads
+	 * that occur before pcie_read_win() has a chance to adjust.
 	 */
 	timeouts.ReadIntervalTimeout = MAXDWORD;
-	timeouts.ReadTotalTimeoutMultiplier = 0;
-	timeouts.ReadTotalTimeoutConstant = 0;
+	timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
+	timeouts.ReadTotalTimeoutConstant = 5000;
 	timeouts.WriteTotalTimeoutConstant = 5000;
 	timeouts.WriteTotalTimeoutMultiplier = 0;
 
@@ -603,29 +602,37 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 			 unsigned int timeout)
 {
 	struct qdl_device_pcie_win *pcie;
-	DWORD deadline;
+	COMMTIMEOUTS ct = {0};
 	DWORD n = 0;
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
-	deadline = GetTickCount() + (timeout ? timeout : 5000);
 
 	/*
-	 * Poll with non-blocking ReadFile until data arrives or
-	 * the timeout expires.  COMMTIMEOUTS is configured for
-	 * immediate return so this works even with drivers that
-	 * ignore ReadTotalTimeoutConstant.
+	 * Use the MAXDWORD/MAXDWORD/timeout special case (MSDN):
+	 *
+	 *  1. If data is already in the receive buffer, ReadFile
+	 *     returns immediately with all available bytes.
+	 *  2. If the buffer is empty, ReadFile blocks up to
+	 *     ReadTotalTimeoutConstant ms for the first byte.
+	 *  3. Once any byte arrives, ReadFile returns immediately
+	 *     with all available data (no inter-character wait).
+	 *
+	 * This replaces the previous Sleep(10) polling loop, which
+	 * left gaps where the COM port receive buffer could overflow
+	 * during sustained raw-mode data transfers from NAND reads.
 	 */
-	do {
-		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
-			return -EIO;
+	ct.ReadIntervalTimeout = MAXDWORD;
+	ct.ReadTotalTimeoutMultiplier = MAXDWORD;
+	ct.ReadTotalTimeoutConstant = timeout ? timeout : 5000;
+	SetCommTimeouts(pcie->hSerial, &ct);
 
-		if (n > 0)
-			return (int)n;
+	if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
+		return -EIO;
 
-		Sleep(10);
-	} while (GetTickCount() < deadline);
+	if (n == 0)
+		return -ETIMEDOUT;
 
-	return -ETIMEDOUT;
+	return (int)n;
 }
 
 static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
