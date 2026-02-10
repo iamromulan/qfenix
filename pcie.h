@@ -64,5 +64,6 @@ struct bhi_info {
 #define MHI_MAX_PORTS	10
 
 struct qdl_device *pcie_init(void);
+int pcie_has_device(void);
 
 #endif /* __PCIE_H__ */

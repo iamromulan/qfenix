@@ -14,6 +14,8 @@ int gpt_set_active_slot(struct qdl_device *qdl, char slot);
 int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir);
 int gpt_read_partition(struct qdl_device *qdl, const char *label,
 		       const char *outfile);
+int gpt_read_partition_to_dir(struct qdl_device *qdl, const char *label,
+			      const char *outdir);
 int gpt_read_full_storage(struct qdl_device *qdl, const char *outfile);
 int gpt_make_xml(struct qdl_device *qdl, const char *outdir,
 		 bool make_read, bool make_program);

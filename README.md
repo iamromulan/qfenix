@@ -28,8 +28,9 @@ the original QDL:
   workflows like backup-then-erase-then-flash within a single XML.
 - **DIAG to EDL Auto-Switching** - Automatically switches devices from DIAG mode to
   EDL mode (can be disabled with `--no-auto-edl`). Works on both Linux and Windows.
-- **PCIe/MHI Transport** (`-P` / `--pcie`) - Flash PCIe-connected modems (T99W175,
+- **PCIe/MHI Transport** - Flash PCIe-connected modems (T99W175,
   T99W373, T99W640, etc.) via MHI BHI on Linux or COM ports on Windows.
+  Auto-detected when `/dev/mhi_*` devices are present (`--pcie` flag optional).
 - **DIAG Protocol** - NV item read/write, EFS directory listing, file download, and
   factory image dump — all over the DIAG serial port.
 - **Comprehensive Device Listing** - `qfenix list` shows USB EDL devices, DIAG serial
@@ -42,7 +43,7 @@ the original QDL:
   (e.g. `--serial COM49`) to target a specific modem when multiple are connected.
 - **MD5 Verification** - Verifies firmware file integrity before flashing when MD5
   checksums are present in the XML (can be skipped with `--skip-md5`)
-- **Partition Backup** - Read individual partitions by label (`read`) or dump all
+- **Partition Backup** - Read one or more partitions by label (`read`) or dump all
   at once (`readall`). Supports full-storage single-file dumps for complete
   backup/restore via `--single-file`. Auto-detects file extensions from partition
   content (`.elf`, `.ubi`, `.img`, etc.). Automatic retry on read failures.
@@ -85,7 +86,7 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `reset` | Reset/power-off/EDL-reboot a device |
 | `getslot` | Show the active A/B slot |
 | `setslot` | Set the active A/B slot |
-| `read` | Read a single partition by label |
+| `read` | Read one or more partitions by label |
 | `readall` | Dump all partitions to files |
 | `nvread` | Read an NV item via DIAG |
 | `nvwrite` | Write an NV item via DIAG |
@@ -102,7 +103,7 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `-F, --firmware-dir=PATH` | Recursively auto-detect and load firmware from directory |
 | `-E, --no-auto-edl` | Disable automatic DIAG to EDL mode switching |
 | `-M, --skip-md5` | Skip MD5 verification of firmware files |
-| `-P, --pcie` | Use PCIe/MHI transport instead of USB |
+| `-P, --pcie` | Force PCIe/MHI transport (auto-detected on Linux) |
 | `-S, --serial=T` | Target device by serial number or COM port name |
 
 ### EDL mode
@@ -225,6 +226,9 @@ qfenix readall -L /path/to/firmware/ --single-file=/path/to/full_backup.bin
 # Read a single partition by label
 qfenix read efs2 -L /path/to/firmware/ -o /path/to/efs2_backup.bin
 
+# Read multiple partitions at once (auto-named with detected extensions)
+qfenix read efs2 modem system -L /path/to/firmware/ -o /path/to/backups/
+
 # If -o is omitted, output goes to the loader directory
 qfenix read modem -L /path/to/firmware/
 ```
@@ -234,7 +238,10 @@ qfenix read modem -L /path/to/firmware/
 Flash PCIe-connected modems (Dell DW5930e/DW5931e/DW5934e, Foxconn T99W175/T99W373/T99W640, etc.):
 
 ```bash
-# Linux: uses MHI BHI for programmer upload
+# Linux: auto-detected when /dev/mhi_* devices are present
+qfenix -F /path/to/firmware/
+
+# Or explicitly specify PCIe transport
 qfenix --pcie -F /path/to/firmware/
 
 # Windows: uses COM port (auto-detected or specified)

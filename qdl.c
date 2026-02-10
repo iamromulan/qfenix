@@ -1534,6 +1534,12 @@ static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
 	if (ret < 0)
 		return -1;
 
+	/* Auto-detect PCIe if no transport explicitly chosen */
+	if (!use_pcie && pcie_has_device()) {
+		ux_info("PCIe MHI modem detected, using PCIe transport\n");
+		use_pcie = true;
+	}
+
 	qdl = qdl_init(use_pcie ? QDL_DEVICE_PCIE : QDL_DEVICE_USB);
 	if (!qdl)
 		return -1;
@@ -1551,7 +1557,7 @@ static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
 		 */
 		int need_sahara;
 
-		need_sahara = pcie_prepare(qdl, sahara_images[0].name);
+		need_sahara = pcie_prepare(qdl, sahara_images[SAHARA_ID_EHOSTDL_IMG].name);
 		if (need_sahara < 0) {
 			qdl_deinit(qdl);
 			return -1;
@@ -2095,16 +2101,18 @@ static int qdl_read_partition(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
-	const char *outfile = NULL;
+	const char *output = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
-	const char *label;
 	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	char auto_path[4096];
+	const char **labels;
+	int nlabels;
 	int opt;
 	int ret;
+	int i;
 
 	static struct option options[] = {
 		{"debug", no_argument, 0, 'd'},
@@ -2134,7 +2142,7 @@ static int qdl_read_partition(int argc, char **argv)
 			storage_set = true;
 			break;
 		case 'o':
-			outfile = optarg;
+			output = optarg;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -2145,8 +2153,10 @@ static int qdl_read_partition(int argc, char **argv)
 		case 'h':
 		default:
 			fprintf(stderr,
-				"Usage: qfenix read <label> [-L dir | <programmer>] [-o output] [--serial=S] [--storage=T] [--pcie]\n"
-				"\nRead a single partition by label.\n"
+				"Usage: qfenix read <label> [label2 ...] [-L dir | <programmer>] [-o output] [--serial=S] [--storage=T] [--pcie]\n"
+				"\nRead partitions by label.\n"
+				"With one label, -o is an output file path.\n"
+				"With multiple labels, -o is a directory (auto-named files with detected extensions).\n"
 				"If -o is omitted, output to the loader directory (or current directory).\n");
 			return opt == 'h' ? 0 : 1;
 		}
@@ -2156,9 +2166,14 @@ static int qdl_read_partition(int argc, char **argv)
 		fprintf(stderr, "Error: partition label required\n");
 		return 1;
 	}
-	label = argv[optind++];
+
+	/* Collect labels — all positional args before programmer */
+	labels = (const char **)&argv[optind];
 
 	if (loader_dir) {
+		/* All remaining positional args are labels */
+		nlabels = argc - optind;
+
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
@@ -2166,25 +2181,52 @@ static int qdl_read_partition(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
+	} else {
+		/*
+		 * Last positional arg is the programmer, rest are labels.
+		 * Need at least 2 args: one label + one programmer.
+		 */
+		nlabels = argc - optind - 1;
+		if (nlabels < 1) {
+			fprintf(stderr, "Error: partition label and programmer (or -L) required\n");
+			return 1;
+		}
 	}
 
-	if (!outfile) {
-		const char *dir = loader_dir ? loader_dir : ".";
-		snprintf(auto_path, sizeof(auto_path), "%s/%s.bin", dir, label);
-		outfile = auto_path;
-	}
-
-	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+	/* Open firehose session */
+	ret = firehose_session_open(&qdl,
+				    programmer ? programmer : argv[optind + nlabels],
 				    storage_type, serial, use_pcie);
 	if (ret) {
 		free(programmer);
 		return 1;
 	}
 
-	ret = gpt_read_partition(qdl, label, outfile);
+	if (nlabels == 1 && output) {
+		/* Single label with explicit output file */
+		ret = gpt_read_partition(qdl, labels[0], output);
+	} else if (nlabels == 1) {
+		/* Single label, auto-generate filename */
+		const char *dir = loader_dir ? loader_dir : ".";
+
+		snprintf(auto_path, sizeof(auto_path), "%s/%s.bin",
+			 dir, labels[0]);
+		ret = gpt_read_partition(qdl, labels[0], auto_path);
+	} else {
+		/* Multiple labels — output is a directory */
+		const char *outdir = output ? output : (loader_dir ? loader_dir : ".");
+
+#ifdef _WIN32
+		mkdir(outdir);
+#else
+		mkdir(outdir, 0755);
+#endif
+		ret = 0;
+		for (i = 0; i < nlabels; i++) {
+			if (gpt_read_partition_to_dir(qdl, labels[i], outdir))
+				ret = -1;
+		}
+	}
 
 	firehose_session_close(qdl, true);
 	free(programmer);
@@ -2902,6 +2944,18 @@ static int qdl_flash(int argc, char **argv)
 	if (ret < 0)
 		goto out_cleanup;
 
+	/* Auto-detect PCIe if no transport explicitly chosen */
+	if (qdl_dev_type == QDL_DEVICE_USB && pcie_has_device()) {
+		ux_info("PCIe MHI modem detected, using PCIe transport\n");
+		qdl_deinit(qdl);
+		qdl = qdl_init(QDL_DEVICE_PCIE);
+		if (!qdl) {
+			ret = -1;
+			goto out_cleanup;
+		}
+		qdl_dev_type = QDL_DEVICE_PCIE;
+	}
+
 	if (qdl_dev_type == QDL_DEVICE_PCIE) {
 		/*
 		 * PCIe: DIAG→EDL switch + programmer upload.
@@ -2910,7 +2964,7 @@ static int qdl_flash(int argc, char **argv)
 		 */
 		int need_sahara;
 
-		need_sahara = pcie_prepare(qdl, sahara_images[0].name);
+		need_sahara = pcie_prepare(qdl, sahara_images[SAHARA_ID_EHOSTDL_IMG].name);
 		if (need_sahara < 0)
 			goto out_cleanup;
 
