@@ -9,6 +9,8 @@
 /* DIAG command codes */
 #define DIAG_NV_READ_F		0x26
 #define DIAG_NV_WRITE_F		0x27
+#define DIAG_SPC_F		0x41
+#define DIAG_PASSWORD_F		0x46
 #define DIAG_SUBSYS_CMD_F	0x4B
 
 /* NV subsystem ID for indexed reads/writes */

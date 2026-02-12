@@ -487,6 +487,62 @@ static int diag_port_read_frame(intptr_t fd, uint8_t *buf, size_t buf_size,
 
 #endif /* _WIN32 */
 
+/*
+ * Send SPC (Service Programming Code) for DIAG authentication.
+ * Default SPC is "000000" (six ASCII zeros).
+ */
+static int diag_send_spc(struct diag_session *sess)
+{
+	uint8_t cmd[7];
+	uint8_t resp[8];
+	int n;
+
+	cmd[0] = DIAG_SPC_F;
+	/* Default SPC: "000000" = 0x30 x 6 */
+	memset(&cmd[1], 0x30, 6);
+
+	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+	if (n < 2)
+		return -1;
+
+	if (resp[0] != DIAG_SPC_F || resp[1] != 1) {
+		ux_debug("SPC authentication failed (status=%d)\n",
+			 n >= 2 ? resp[1] : -1);
+		return -1;
+	}
+
+	ux_debug("SPC authentication successful\n");
+	return 0;
+}
+
+/*
+ * Send Security Password for DIAG authentication.
+ * Default password is 0xFFFFFFFFFFFFFF7E (standard Qualcomm default).
+ */
+static int diag_send_password(struct diag_session *sess)
+{
+	uint8_t cmd[9];
+	uint8_t resp[16];
+	int n;
+
+	cmd[0] = DIAG_PASSWORD_F;
+	memset(&cmd[1], 0xFF, 7);
+	cmd[8] = 0xFE;
+
+	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+	if (n < 2)
+		return -1;
+
+	if (resp[0] != DIAG_PASSWORD_F || resp[1] != 1) {
+		ux_debug("security password authentication failed (status=%d)\n",
+			 n >= 2 ? resp[1] : -1);
+		return -1;
+	}
+
+	ux_debug("security password authentication successful\n");
+	return 0;
+}
+
 struct diag_session *diag_open(const char *serial)
 {
 	struct diag_session *sess;
@@ -528,6 +584,10 @@ struct diag_session *diag_open(const char *serial)
 		}
 	}
 #endif
+
+	/* Authenticate with SPC and security password */
+	diag_send_spc(sess);
+	diag_send_password(sess);
 
 	return sess;
 }
@@ -828,7 +888,9 @@ static int efs_readdir(struct diag_session *sess, int32_t dirp,
 	if (n < 40)
 		return -1;
 
-	memcpy(&diag_errno, &resp[8], 4);
+	memcpy(&diag_errno, &resp[12], 4);
+	if (diag_errno != 0)
+		return -1;
 
 	memcpy(&entry->entry_type, &resp[16], 4);
 	memcpy(&entry->mode, &resp[20], 4);
@@ -874,7 +936,7 @@ int diag_efs_listdir(struct diag_session *sess, const char *path,
 {
 	struct efs_dirent entry;
 	int32_t dirp;
-	uint32_t seqno = 0;
+	uint32_t seqno = 1;
 	int ret;
 
 	if (!sess->efs_detected) {
