@@ -1708,6 +1708,9 @@ static int qdl_printgpt(int argc, char **argv)
 		}
 	}
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -1716,9 +1719,6 @@ static int qdl_printgpt(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
@@ -1790,6 +1790,9 @@ static int qdl_storageinfo(int argc, char **argv)
 		}
 	}
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -1798,9 +1801,6 @@ static int qdl_storageinfo(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
@@ -1892,6 +1892,9 @@ static int qdl_reset(int argc, char **argv)
 		}
 	}
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -1900,9 +1903,6 @@ static int qdl_reset(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
@@ -1973,6 +1973,9 @@ static int qdl_getslot(int argc, char **argv)
 		}
 	}
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -1981,9 +1984,6 @@ static int qdl_getslot(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
@@ -2068,6 +2068,9 @@ static int qdl_setslot(int argc, char **argv)
 	}
 	optind++;
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -2076,9 +2079,6 @@ static int qdl_setslot(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
@@ -2170,6 +2170,11 @@ static int qdl_read_partition(int argc, char **argv)
 	/* Collect labels — all positional args before programmer */
 	labels = (const char **)&argv[optind];
 
+	if (!loader_dir && (optind >= argc || argc - optind < 2)) {
+		/* No -L and not enough args for label+programmer — default to cwd */
+		loader_dir = ".";
+	}
+
 	if (loader_dir) {
 		/* All remaining positional args are labels */
 		nlabels = argc - optind;
@@ -2187,10 +2192,11 @@ static int qdl_read_partition(int argc, char **argv)
 		 * Need at least 2 args: one label + one programmer.
 		 */
 		nlabels = argc - optind - 1;
-		if (nlabels < 1) {
-			fprintf(stderr, "Error: partition label and programmer (or -L) required\n");
-			return 1;
-		}
+	}
+
+	if (nlabels < 1) {
+		fprintf(stderr, "Error: at least one partition label is required\n");
+		return 1;
 	}
 
 	/* Open firehose session */
@@ -2296,6 +2302,9 @@ static int qdl_readall(int argc, char **argv)
 		}
 	}
 
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
@@ -2304,9 +2313,6 @@ static int qdl_readall(int argc, char **argv)
 		}
 		if (!storage_set)
 			storage_type = detect_storage_from_directory(loader_dir);
-	} else if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		return 1;
 	}
 
 	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],

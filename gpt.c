@@ -877,6 +877,8 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 		return -1;
 	}
 
+	int ubi_count = 0;
+
 	for (i = 0; i < ptable.numparts; i++) {
 		struct smem_flash_pentry *e = &ptable.pentry[i];
 		unsigned int start_pages = e->offset * pages_per_block;
@@ -907,11 +909,24 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 			failed++;
 		} else {
 			count++;
+			if (!strcmp(ext, ".ubi"))
+				ubi_count++;
 		}
 	}
 
 	ux_info("read %d partitions (%d failed) to %s\n",
 		count, failed, outdir);
+
+	if (ubi_count > 0)
+		ux_err("WARNING: %d UBI partition(s) were read as raw NAND images.\n"
+		       "  Raw UBI images have device-specific erase counters and wear-leveling\n"
+		       "  data baked in. Flashing them to another device (or even the same device)\n"
+		       "  will likely cause UBI errors and fail to mount.\n"
+		       "  To make them flashable, extract and re-ubinize first:\n"
+		       "    ubireader_extract_images <file.ubi>\n"
+		       "    ubinize -o <new.ubi> ubinize.cfg\n",
+		       ubi_count);
+
 	return failed ? -1 : 0;
 }
 
@@ -1065,9 +1080,18 @@ static int nand_read_partition(struct qdl_device *qdl, const char *label,
 		ux_info("reading partition '%s' (%u pages) to %s\n",
 			display_name, num_pages, outfile);
 
-		return firehose_read_to_file(qdl, 0, start_pages,
-					     num_pages, sector_size,
-					     pages_per_block, outfile);
+		ret = firehose_read_to_file(qdl, 0, start_pages,
+					    num_pages, sector_size,
+					    pages_per_block, outfile);
+		if (ret == 0) {
+			const char *dot = strrchr(outfile, '.');
+			if (dot && !strcmp(dot, ".ubi"))
+				ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+				       "  Do not flash it directly — extract and re-ubinize first.\n"
+				       "  See: ubireader_extract_images / ubinize\n",
+				       outfile);
+		}
+		return ret;
 	}
 
 	ux_err("no partition '%s' found in NAND partition table\n", label);
@@ -1197,9 +1221,15 @@ static int nand_read_partition_to_dir(struct qdl_device *qdl,
 		ux_info("reading partition '%s' (%u pages) to %s\n",
 			display_name, num_pages, filepath);
 
-		return firehose_read_to_file(qdl, 0, start_pages,
-					      num_pages, sector_size,
-					      pages_per_block, filepath);
+		ret = firehose_read_to_file(qdl, 0, start_pages,
+					    num_pages, sector_size,
+					    pages_per_block, filepath);
+		if (ret == 0 && !strcmp(ext, ".ubi"))
+			ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+			       "  Do not flash it directly — extract and re-ubinize first.\n"
+			       "  See: ubireader_extract_images / ubinize\n",
+			       filepath);
+		return ret;
 	}
 
 	ux_err("no partition '%s' found in NAND partition table\n", label);

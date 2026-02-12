@@ -1390,7 +1390,7 @@ int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 	if (!sector_size)
 		sector_size = qdl->sector_size;
 
-	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 	if (fd < 0) {
 		ux_err("failed to open %s for writing: %s\n",
 		       filename, strerror(errno));
