@@ -94,6 +94,7 @@ struct qdl_device *usb_init(void);
 struct qdl_device *sim_init(void);
 struct qdl_device *pcie_init(void);
 int pcie_prepare(struct qdl_device *qdl, const char *programmer_path);
+int pcie_has_device(void);
 
 struct qdl_device_desc {
 	int vid;

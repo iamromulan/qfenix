@@ -870,8 +870,10 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 				 * as possible (better to lose a few bytes
 				 * at the end than an entire chunk).
 				 */
-				if (got > 0 && fd >= 0)
-					(void)write(fd, buf, got);
+				if (got > 0 && fd >= 0) {
+					int wr __attribute__((unused));
+					wr = write(fd, buf, got);
+				}
 				ret = -1;
 				goto drain;
 			}
@@ -879,8 +881,10 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 				ux_err("unexpected EOF at %.1f%% of %s\n",
 				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
 				       read_op->filename ? read_op->filename : "?");
-				if (got > 0 && fd >= 0)
-					(void)write(fd, buf, got);
+				if (got > 0 && fd >= 0) {
+					int wr __attribute__((unused));
+					wr = write(fd, buf, got);
+				}
 				ret = -1;
 				goto drain;
 			}
@@ -1378,27 +1382,57 @@ int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 {
 	struct read_op op;
 	char start_str[32];
+	unsigned int sectors_done = 0;
+	int retries_left = 3;
 	int fd;
 	int ret;
 
-	snprintf(start_str, sizeof(start_str), "%u", start_sector);
+	if (!sector_size)
+		sector_size = qdl->sector_size;
 
-	memset(&op, 0, sizeof(op));
-	op.sector_size = sector_size;
-	op.pages_per_block = pages_per_block;
-	op.start_sector = start_str;
-	op.num_sectors = num_sectors;
-	op.partition = partition;
-	op.filename = filename;
-
-	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 	if (fd < 0) {
 		ux_err("failed to open %s for writing: %s\n",
 		       filename, strerror(errno));
 		return -1;
 	}
 
+retry:
+	snprintf(start_str, sizeof(start_str), "%u",
+		 start_sector + sectors_done);
+
+	memset(&op, 0, sizeof(op));
+	op.sector_size = sector_size;
+	op.pages_per_block = pages_per_block;
+	op.start_sector = start_str;
+	op.num_sectors = num_sectors - sectors_done;
+	op.partition = partition;
+	op.filename = filename;
+
 	ret = firehose_issue_read(qdl, &op, fd, NULL, 0, false);
+	if (ret && retries_left > 0) {
+		/*
+		 * Check how many complete sectors were written.
+		 * If we made progress, seek back to the sector
+		 * boundary (in case of a partial write) and retry
+		 * the remaining sectors with a new read command.
+		 */
+		off_t pos = lseek(fd, 0, SEEK_CUR);
+		unsigned int written = pos > 0 ?
+			(unsigned int)(pos / sector_size) : 0;
+
+		if (written > sectors_done) {
+			sectors_done = written;
+			lseek(fd, (off_t)sectors_done * sector_size,
+			      SEEK_SET);
+			retries_left--;
+			ux_info("retrying from sector %u (%u of %u remaining)\n",
+				start_sector + sectors_done,
+				num_sectors - sectors_done, num_sectors);
+			goto retry;
+		}
+	}
+
 	close(fd);
 	return ret;
 }

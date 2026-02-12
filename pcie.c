@@ -89,9 +89,12 @@ static int pcie_switch_to_edl(int port_index)
 
 	diagfd = open(diag_path, O_RDWR | O_NOCTTY);
 	if (diagfd < 0) {
-		/* No DIAG port means device may already be in EDL */
-		ux_debug("no DIAG port %s, device may already be in EDL\n",
-			 diag_path);
+		if (access(diag_path, F_OK) == 0)
+			ux_info("cannot open %s: %s (try running as root)\n",
+				diag_path, strerror(errno));
+		else
+			ux_debug("no DIAG port %s, device may already be in EDL\n",
+				 diag_path);
 		return 0;
 	}
 
@@ -351,6 +354,11 @@ int pcie_prepare(struct qdl_device *qdl, const char *programmer_path)
 	return pcie_upload_programmer(port_index, programmer_path);
 }
 
+int pcie_has_device(void)
+{
+	return pcie_find_port() >= 0;
+}
+
 struct qdl_device *pcie_init(void)
 {
 	struct qdl_device_pcie *pcie;
@@ -522,9 +530,19 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		/* User specified a COM port directly */
 		snprintf(port, sizeof(port), "%s", serial);
 	} else {
-		/* Auto-detect EDL COM port */
-		if (!pcie_detect_edl_port_win(port, sizeof(port))) {
-			ux_err("no EDL COM port detected\n");
+		/* Auto-detect EDL COM port with retry for enumeration delay */
+		int attempts;
+
+		for (attempts = 0; attempts < 10; attempts++) {
+			if (pcie_detect_edl_port_win(port, sizeof(port)))
+				break;
+			if (attempts == 0)
+				ux_info("waiting for EDL COM port...\n");
+			Sleep(1000);
+		}
+		if (!port[0]) {
+			ux_err("no EDL COM port detected after %d seconds\n",
+			       attempts);
 			return -1;
 		}
 	}
@@ -711,6 +729,15 @@ struct qdl_device *pcie_init(void)
 	return qdl;
 }
 
+/*
+ * Windows uses the USB-to-COM fallback mechanism instead of
+ * upfront PCIe detection, so always return 0 here.
+ */
+int pcie_has_device(void)
+{
+	return 0;
+}
+
 #else /* !__linux__ && !_WIN32 */
 
 int pcie_prepare(struct qdl_device *qdl, const char *programmer_path)
@@ -725,6 +752,11 @@ struct qdl_device *pcie_init(void)
 {
 	ux_err("PCIe/MHI transport is not supported on this platform\n");
 	return NULL;
+}
+
+int pcie_has_device(void)
+{
+	return 0;
 }
 
 #endif

@@ -877,6 +877,8 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 		return -1;
 	}
 
+	int ubi_count = 0;
+
 	for (i = 0; i < ptable.numparts; i++) {
 		struct smem_flash_pentry *e = &ptable.pentry[i];
 		unsigned int start_pages = e->offset * pages_per_block;
@@ -907,11 +909,24 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 			failed++;
 		} else {
 			count++;
+			if (!strcmp(ext, ".ubi"))
+				ubi_count++;
 		}
 	}
 
 	ux_info("read %d partitions (%d failed) to %s\n",
 		count, failed, outdir);
+
+	if (ubi_count > 0)
+		ux_err("WARNING: %d UBI partition(s) were read as raw NAND images.\n"
+		       "  Raw UBI images have device-specific erase counters and wear-leveling\n"
+		       "  data baked in. Flashing them to another device (or even the same device)\n"
+		       "  will likely cause UBI errors and fail to mount.\n"
+		       "  To make them flashable, extract and re-ubinize first:\n"
+		       "    ubireader_extract_images <file.ubi>\n"
+		       "    ubinize -o <new.ubi> ubinize.cfg\n",
+		       ubi_count);
+
 	return failed ? -1 : 0;
 }
 
@@ -969,6 +984,377 @@ int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 	ux_info("read %d partitions (%d failed) to %s\n",
 		count, failed, outdir);
 	return failed ? -1 : 0;
+}
+
+static int nand_read_partition(struct qdl_device *qdl, const char *label,
+			      const char *outfile)
+{
+	struct smem_flash_ptable ptable;
+	struct storage_info sinfo;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	unsigned int pages_per_block;
+	char sector_str[16];
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	int mibib_sector;
+	unsigned int i;
+	int ret;
+
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	memcpy(&ptable, buf, sizeof(ptable));
+
+	if (ptable.magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable.magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic\n");
+		return -1;
+	}
+
+	if (ptable.version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable.numparts > max_parts) {
+		ux_err("SMEM table has %u entries, capping at %u\n",
+		       ptable.numparts, max_parts);
+		ptable.numparts = max_parts;
+	}
+
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size) {
+		ux_err("failed to get NAND block size from storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	if (!pages_per_block) {
+		ux_err("invalid block_size/page_size ratio\n");
+		return -1;
+	}
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+		unsigned int start_pages = e->offset * pages_per_block;
+		unsigned int num_pages = e->length * pages_per_block;
+
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		const char *display_name = name;
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		if (strcmp(display_name, label) != 0)
+			continue;
+
+		ux_info("reading partition '%s' (%u pages) to %s\n",
+			display_name, num_pages, outfile);
+
+		ret = firehose_read_to_file(qdl, 0, start_pages,
+					    num_pages, sector_size,
+					    pages_per_block, outfile);
+		if (ret == 0) {
+			const char *dot = strrchr(outfile, '.');
+			if (dot && !strcmp(dot, ".ubi"))
+				ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+				       "  Do not flash it directly — extract and re-ubinize first.\n"
+				       "  See: ubireader_extract_images / ubinize\n",
+				       outfile);
+		}
+		return ret;
+	}
+
+	ux_err("no partition '%s' found in NAND partition table\n", label);
+	return -1;
+}
+
+int gpt_read_partition(struct qdl_device *qdl, const char *label,
+		       const char *outfile)
+{
+	int phys_partition = -1;
+	unsigned int start_sector;
+	unsigned int num_sectors;
+	int ret;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_read_partition(qdl, label, outfile);
+
+	ret = gpt_find_by_name(qdl, label, &phys_partition,
+			       &start_sector, &num_sectors);
+	if (ret < 0)
+		return -1;
+
+	ux_info("reading partition '%s' (%u sectors) to %s\n",
+		label, num_sectors, outfile);
+
+	return firehose_read_to_file(qdl, phys_partition,
+				     start_sector, num_sectors,
+				     qdl->sector_size, 0, outfile);
+}
+
+static int nand_read_partition_to_dir(struct qdl_device *qdl,
+				     const char *label, const char *outdir)
+{
+	struct smem_flash_ptable ptable;
+	struct storage_info sinfo;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	unsigned int pages_per_block;
+	char sector_str[16];
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	char filepath[4096];
+	int mibib_sector;
+	unsigned int i;
+	int ret;
+
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	memcpy(&ptable, buf, sizeof(ptable));
+
+	if (ptable.magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable.magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic\n");
+		return -1;
+	}
+
+	if (ptable.version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable.numparts > max_parts)
+		ptable.numparts = max_parts;
+
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size) {
+		ux_err("failed to get NAND block size from storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	if (!pages_per_block) {
+		ux_err("invalid block_size/page_size ratio\n");
+		return -1;
+	}
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+		unsigned int start_pages = e->offset * pages_per_block;
+		unsigned int num_pages = e->length * pages_per_block;
+		const char *ext;
+
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		const char *display_name = name;
+
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		if (strcmp(display_name, label) != 0)
+			continue;
+
+		ext = probe_partition_ext(qdl, 0, start_pages,
+					  sector_size, pages_per_block);
+		snprintf(filepath, sizeof(filepath), "%s/%s%s",
+			 outdir, display_name, ext);
+
+		ux_info("reading partition '%s' (%u pages) to %s\n",
+			display_name, num_pages, filepath);
+
+		ret = firehose_read_to_file(qdl, 0, start_pages,
+					    num_pages, sector_size,
+					    pages_per_block, filepath);
+		if (ret == 0 && !strcmp(ext, ".ubi"))
+			ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+			       "  Do not flash it directly — extract and re-ubinize first.\n"
+			       "  See: ubireader_extract_images / ubinize\n",
+			       filepath);
+		return ret;
+	}
+
+	ux_err("no partition '%s' found in NAND partition table\n", label);
+	return -1;
+}
+
+int gpt_read_partition_to_dir(struct qdl_device *qdl, const char *label,
+			      const char *outdir)
+{
+	int phys_partition = -1;
+	unsigned int start_sector;
+	unsigned int num_sectors;
+	char filepath[4096];
+	const char *ext;
+	int ret;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_read_partition_to_dir(qdl, label, outdir);
+
+	ret = gpt_find_by_name(qdl, label, &phys_partition,
+			       &start_sector, &num_sectors);
+	if (ret < 0)
+		return -1;
+
+	ext = probe_partition_ext(qdl, phys_partition, start_sector,
+				  qdl->sector_size, 0);
+	snprintf(filepath, sizeof(filepath), "%s/%s%s", outdir, label, ext);
+
+	ux_info("reading partition '%s' (%u sectors) to %s\n",
+		label, num_sectors, filepath);
+
+	return firehose_read_to_file(qdl, phys_partition,
+				     start_sector, num_sectors,
+				     qdl->sector_size, 0, filepath);
+}
+
+static int nand_read_full_storage(struct qdl_device *qdl, const char *outfile)
+{
+	struct storage_info sinfo;
+	size_t sector_size;
+	unsigned int pages_per_block;
+	unsigned int total_pages;
+	int ret;
+
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size || !sinfo.total_blocks) {
+		ux_err("failed to get NAND storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	total_pages = sinfo.total_blocks * pages_per_block;
+
+	ux_info("reading full NAND storage (%lu blocks, %u pages) to %s\n",
+		sinfo.total_blocks, total_pages, outfile);
+
+	return firehose_read_to_file(qdl, 0, 0, total_pages,
+				     sector_size, pages_per_block, outfile);
+}
+
+int gpt_read_full_storage(struct qdl_device *qdl, const char *outfile)
+{
+	struct storage_info sinfo;
+	unsigned int i;
+	char filepath[4096];
+	int ret = 0;
+	int count = 0;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_read_full_storage(qdl, outfile);
+
+	/* For GPT (UFS/eMMC), dump each LUN as a separate file */
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret) {
+		ux_err("failed to get storage info\n");
+		return -1;
+	}
+
+	for (i = 0; i < sinfo.num_physical; i++) {
+		struct storage_info lun_info;
+
+		ret = firehose_getstorageinfo(qdl, i, &lun_info);
+		if (ret || !lun_info.total_blocks)
+			continue;
+
+		if (sinfo.num_physical == 1) {
+			snprintf(filepath, sizeof(filepath), "%s", outfile);
+		} else {
+			/* Insert LUN number before extension */
+			const char *dot = strrchr(outfile, '.');
+			if (dot) {
+				snprintf(filepath, sizeof(filepath),
+					 "%.*s_lun%u%s",
+					 (int)(dot - outfile), outfile,
+					 i, dot);
+			} else {
+				snprintf(filepath, sizeof(filepath),
+					 "%s_lun%u", outfile, i);
+			}
+		}
+
+		ux_info("reading LUN %u (%lu sectors) to %s\n",
+			i, lun_info.total_blocks, filepath);
+
+		ret = firehose_read_to_file(qdl, i, 0,
+					    lun_info.total_blocks,
+					    qdl->sector_size, 0,
+					    filepath);
+		if (ret < 0) {
+			ux_err("failed to read LUN %u\n", i);
+		} else {
+			count++;
+		}
+	}
+
+	return count > 0 ? 0 : -1;
 }
 
 static const char *storage_type_str(enum qdl_storage_type t)
