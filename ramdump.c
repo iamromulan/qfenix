@@ -7,7 +7,7 @@
 #include "qdl.h"
 
 #ifdef _WIN32
-const char *__progname = "ramdump";
+const char *__progname = "qfenix-ramdump";
 #endif
 
 bool qdl_debug;

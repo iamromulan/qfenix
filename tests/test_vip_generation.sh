@@ -9,13 +9,13 @@ FLAT_BUILD=${SCRIPT_PATH}/data
 
 REP_ROOT=${SCRIPT_PATH}/..
 VIP_PATH=${FLAT_BUILD}/vip
-EXPECTED_DIGEST="d93fc596a037abe4977f50ca68e1bf57377299a496cb1436a9421579517cef13"
+EXPECTED_DIGEST="58ed5c49e45e9c63fd727ea89162d4cf8196e942b0cf77c921b77455374a91e4"
 VIP_TABLE_FILE=${VIP_PATH}/DigestsToSign.bin
 
 mkdir -p $VIP_PATH
 
 cd $FLAT_BUILD
-${REP_ROOT}/qdl --dry-run --create-digests=${VIP_PATH} \
+${REP_ROOT}/qfenix --dry-run --create-digests=${VIP_PATH} \
         prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 
 if command -v sha256sum >/dev/null 2>&1; then

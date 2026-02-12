@@ -13,6 +13,7 @@ struct program {
 	unsigned int file_offset;
 	const char *filename;
 	const char *label;
+	const char *md5;
 	unsigned int num_sectors;
 	int partition;
 	bool sparse;
@@ -40,7 +41,10 @@ int program_find_bootable_partition(bool *multiple_found);
 int program_is_sec_partition_flashed(void);
 int program_cmd_add(const char *address, const char *filename);
 int program_resolve_gpt_deferrals(struct qdl_device *qdl);
+int program_verify_md5(void);
 
 void free_programs(void);
+
+extern bool qdl_skip_md5;
 
 #endif

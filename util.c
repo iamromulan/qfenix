@@ -27,9 +27,13 @@ static uint8_t to_hex(uint8_t ch)
 
 void print_version(void)
 {
-	extern const char *__progname;
-
-	fprintf(stdout, "%s version %s\n", __progname, VERSION);
+	fprintf(stdout, "qfenix\n");
+	fprintf(stdout, "A qdl fork that aims to add more features, by iamromulan.\n");
+#ifdef BUILD_STATIC
+	fprintf(stdout, "qfenix %s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
+#else
+	fprintf(stdout, "qfenix %s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
+#endif
 }
 
 void print_hex_dump(const char *prefix, const void *buf, size_t len)

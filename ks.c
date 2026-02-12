@@ -17,7 +17,7 @@
 #include "oscompat.h"
 
 #ifdef _WIN32
-const char *__progname = "ks";
+const char *__progname = "qfenix-ks";
 #endif
 
 static struct qdl_device qdl;

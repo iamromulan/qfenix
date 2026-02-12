@@ -478,7 +478,7 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 		num_sectors = (sb.st_size + sector_size - 1) / sector_size;
 
 		if (program->num_sectors && num_sectors > program->num_sectors) {
-			ux_err("%s to big for %s truncated to %d\n",
+			ux_err("%s too big for %s truncated to %d\n",
 			       program->filename,
 			       program->label,
 			       program->num_sectors * sector_size);
@@ -502,12 +502,16 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
+	if (program->label)
+		xml_setpropf(node, "label", "%s", program->label);
 	if (program->filename)
 		xml_setpropf(node, "filename", "%s", program->filename);
 
 	if (program->is_nand) {
 		xml_setpropf(node, "PAGES_PER_BLOCK", "%d", program->pages_per_block);
-		xml_setpropf(node, "last_sector", "%d", program->last_sector);
+		/* Only add last_sector if it was explicitly set in the XML */
+		if (program->last_sector)
+			xml_setpropf(node, "last_sector", "%d", program->last_sector);
 	}
 
 	ret = firehose_write(qdl, doc);
