@@ -842,6 +842,10 @@ int diag_nv_write_sub(struct diag_session *sess, uint16_t item,
 	return 0;
 }
 
+/* Forward declaration — used in readfile and backup tree walk */
+static int efs_get_item(struct diag_session *sess, const char *path,
+			uint8_t *buf, size_t buf_size, int32_t *data_len_out);
+
 /* EFS helper: build subsystem command header */
 static void efs_cmd_header(uint8_t *cmd, uint8_t method, uint8_t efs_cmd)
 {
@@ -849,6 +853,29 @@ static void efs_cmd_header(uint8_t *cmd, uint8_t method, uint8_t efs_cmd)
 	cmd[1] = method;
 	cmd[2] = efs_cmd;
 	cmd[3] = 0x00;
+}
+
+/*
+ * EFS QUERY (opcode 1) — register DIAG client after HELLO.
+ * Some devices require this for proper session setup.
+ */
+static int efs_query(struct diag_session *sess)
+{
+	uint8_t cmd[4];
+	uint8_t resp[64];
+	int n;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_QUERY);
+
+	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+	if (n < 4 || resp[0] != DIAG_SUBSYS_CMD_F) {
+		ux_debug("EFS query not supported\n");
+		return -1;
+	}
+
+	ux_debug("EFS query successful\n");
+	return 0;
 }
 
 int diag_efs_detect(struct diag_session *sess)
@@ -866,6 +893,7 @@ int diag_efs_detect(struct diag_session *sess)
 		sess->efs_method = DIAG_SUBSYS_EFS_ALT;
 		sess->efs_detected = true;
 		ux_debug("EFS detected using alternate method (0x3E)\n");
+		efs_query(sess);
 		return 0;
 	}
 
@@ -878,6 +906,7 @@ int diag_efs_detect(struct diag_session *sess)
 		sess->efs_method = DIAG_SUBSYS_EFS_STD;
 		sess->efs_detected = true;
 		ux_debug("EFS detected using standard method (0x13)\n");
+		efs_query(sess);
 		return 0;
 	}
 
@@ -1151,8 +1180,38 @@ int diag_efs_readfile(struct diag_session *sess, const char *src_path,
 	}
 
 	fdata = efs_open(sess, src_path, 0 /* O_RDONLY */, 0);
-	if (fdata < 0)
-		return -1;
+	if (fdata < 0) {
+		/* File interface failed — try item interface (GET) */
+		uint8_t item_buf[4096];
+		int32_t item_len = 0;
+
+		if (efs_get_item(sess, src_path, item_buf,
+				 sizeof(item_buf), &item_len) != 0)
+			return -1;
+
+		ux_debug("read '%s' via item interface (%d bytes)\n",
+			 src_path, item_len);
+
+		fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY,
+			  0644);
+		if (fd < 0) {
+			ux_err("cannot create %s: %s\n",
+			       dst_path, strerror(errno));
+			return -1;
+		}
+
+		if (item_len > 0 &&
+		    write(fd, item_buf, item_len) != item_len) {
+			ux_err("local write failed: %s\n", strerror(errno));
+			close(fd);
+			return -1;
+		}
+
+		close(fd);
+		ux_info("EFS file '%s' saved to '%s' (%d bytes, item)\n",
+			src_path, dst_path, item_len);
+		return 0;
+	}
 
 	if (efs_stat(sess, src_path, &st) < 0) {
 		ux_err("EFS stat '%s' failed\n", src_path);
@@ -1448,6 +1507,87 @@ static int efs_readlink(struct diag_session *sess, const char *path,
 }
 
 /*
+ * EFS item interface — GET/PUT bypass file-level ACLs.
+ * QPST uses these to access /nv/item_files/ and other restricted paths.
+ */
+
+static int efs_get_item(struct diag_session *sess, const char *path,
+			uint8_t *buf, size_t buf_size, int32_t *data_len_out)
+{
+	uint8_t cmd[4 + 256];
+	uint8_t resp[8192];
+	size_t path_len;
+	int32_t data_length;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_GET);
+	memcpy(&cmd[4], path, path_len);
+
+	n = diag_send(sess, cmd, 4 + path_len, resp, sizeof(resp));
+	if (n < 12)
+		return -1;
+
+	memcpy(&data_length, &resp[4], 4);
+	memcpy(&diag_errno, &resp[8], 4);
+
+	if (diag_errno != 0)
+		return -1;
+
+	if (data_length < 0)
+		return -1;
+
+	if (data_len_out)
+		*data_len_out = data_length;
+
+	if ((size_t)data_length > buf_size)
+		return -1;
+
+	if (data_length > 0 && n > 12)
+		memcpy(buf, &resp[12], data_length);
+
+	return 0;
+}
+
+static int efs_put_item(struct diag_session *sess, const char *path,
+			const uint8_t *data, int32_t data_len,
+			int32_t flags, int32_t mode)
+{
+	uint8_t cmd[4096];
+	uint8_t resp[64];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if ((size_t)data_len + path_len > sizeof(cmd) - 16)
+		return -1;
+
+	memset(cmd, 0, 16);
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_PUT);
+	memcpy(&cmd[4], &data_len, 4);
+	memcpy(&cmd[8], &flags, 4);
+	memcpy(&cmd[12], &mode, 4);
+	memcpy(&cmd[16], data, data_len);
+	memcpy(&cmd[16 + data_len], path, path_len);
+
+	n = diag_send(sess, cmd, 16 + data_len + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0)
+		return -1;
+
+	return 0;
+}
+
+/*
  * FS_IMAGE protocol — modem-generated TAR backup
  */
 
@@ -1646,18 +1786,33 @@ static bool tar_checksum_valid(const uint8_t *header)
 }
 
 /*
- * Recursive EFS tree walk — manual TAR backup
+ * Recursive EFS tree walk — manual TAR backup.
+ *
+ * Collects all entries first and closes the directory handle BEFORE
+ * recursing into subdirectories. The modem has a very limited number
+ * of simultaneous open directory handles (~4), so the old approach of
+ * keeping parent dirs open during recursion caused EACCES failures at
+ * depth >= 4.
  */
+
+struct efs_entry_info {
+	char name[256];
+	int32_t mode;
+	int32_t size;
+	int32_t mtime;
+};
 
 static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
 {
 	struct efs_dirent entry;
 	struct efs_stat st;
+	struct efs_entry_info *entries = NULL;
 	char fullpath[512];
 	char linkbuf[256];
 	int32_t dirp;
 	uint32_t seqno = 1;
-	int ret;
+	int count = 0, capacity = 0;
+	int ret, i;
 
 	dirp = efs_opendir(sess, path);
 	if (dirp < 0) {
@@ -1665,17 +1820,7 @@ static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
 		return -1;
 	}
 
-	/* Write directory header (skip for root "/") */
-	if (strcmp(path, "/") != 0) {
-		if (efs_stat(sess, path, &st) == 0) {
-			/* Ensure trailing slash for directory names in TAR */
-			snprintf(fullpath, sizeof(fullpath), "%s/",
-				 path[0] == '/' ? path + 1 : path);
-			tar_write_header(fd, fullpath, st.mode, 0,
-					 st.mtime, '5', NULL);
-		}
-	}
-
+	/* Collect all directory entries */
 	for (;;) {
 		ret = efs_readdir(sess, dirp, seqno, &entry);
 		if (ret != 0)
@@ -1687,6 +1832,7 @@ static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
 			continue;
 		}
 
+		/* Build full path for stat */
 		if (strcmp(path, "/") == 0)
 			snprintf(fullpath, sizeof(fullpath), "/%s", entry.name);
 		else
@@ -1699,36 +1845,81 @@ static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
 			continue;
 		}
 
-		/* Strip leading '/' for TAR path */
+		/* Grow array if needed */
+		if (count >= capacity) {
+			capacity = capacity ? capacity * 2 : 64;
+			entries = realloc(entries,
+					  capacity * sizeof(*entries));
+			if (!entries) {
+				efs_closedir(sess, dirp);
+				return -1;
+			}
+		}
+
+		strncpy(entries[count].name, entry.name,
+			sizeof(entries[count].name) - 1);
+		entries[count].name[sizeof(entries[count].name) - 1] = '\0';
+		entries[count].mode = st.mode;
+		entries[count].size = st.size;
+		entries[count].mtime = st.mtime;
+		count++;
+		seqno++;
+	}
+
+	/* Close directory handle BEFORE processing — frees it for recursion */
+	efs_closedir(sess, dirp);
+
+	/* Write directory header (skip for root "/") */
+	if (strcmp(path, "/") != 0) {
+		if (efs_stat(sess, path, &st) == 0) {
+			snprintf(fullpath, sizeof(fullpath), "%s/",
+				 path[0] == '/' ? path + 1 : path);
+			tar_write_header(fd, fullpath, st.mode, 0,
+					 st.mtime, '5', NULL);
+		}
+	}
+
+	/* Process collected entries — directory handle is now closed */
+	for (i = 0; i < count; i++) {
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s",
+				 entries[i].name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entries[i].name);
+
 		const char *tar_path = fullpath[0] == '/' ?
 				       fullpath + 1 : fullpath;
 
-		if (S_ISDIR(st.mode)) {
-			/* Recurse into subdirectory */
+		if (S_ISDIR(entries[i].mode)) {
 			ret = efs_backup_tree(sess, fullpath, fd);
-			if (ret < 0) {
+			if (ret < 0)
 				ux_warn("failed to backup directory '%s'\n",
 					fullpath);
-			}
-		} else if (S_ISLNK(st.mode)) {
-			/* Read symlink target and write header */
+		} else if (S_ISLNK(entries[i].mode)) {
 			if (efs_readlink(sess, fullpath, linkbuf,
-					 sizeof(linkbuf)) == 0) {
-				tar_write_header(fd, tar_path, st.mode,
-						 0, st.mtime, '2', linkbuf);
-			}
-		} else if (S_ISREG(st.mode)) {
-			/* Write file header + data */
-			tar_write_header(fd, tar_path, st.mode, st.size,
-					 st.mtime, '0', NULL);
-
-			/* Read file contents */
+					 sizeof(linkbuf)) == 0)
+				tar_write_header(fd, tar_path,
+						 entries[i].mode, 0,
+						 entries[i].mtime,
+						 '2', linkbuf);
+		} else {
+			/*
+			 * Regular files, EFS item files (mode 0160xxx),
+			 * and anything else non-directory: try to read.
+			 */
 			int32_t fdata = efs_open(sess, fullpath,
 						 0 /* O_RDONLY */, 0);
 			if (fdata >= 0) {
 				uint8_t buf[EFS_MAX_READ_REQ];
 				uint32_t offset = 0;
-				int32_t remaining = st.size;
+				int32_t remaining = entries[i].size;
+
+				tar_write_header(fd, tar_path,
+						 entries[i].mode,
+						 entries[i].size,
+						 entries[i].mtime,
+						 '0', NULL);
 
 				while (remaining > 0) {
 					uint32_t chunk = remaining >
@@ -1749,21 +1940,22 @@ static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
 				}
 				efs_close(sess, fdata);
 
-				/* Pad to 512-byte boundary */
-				if (st.size % 512) {
+				if (entries[i].size % 512) {
 					uint8_t pad[512] = {0};
-					int pad_len = 512 - (st.size % 512);
+					int pad_len = 512 -
+						      (entries[i].size % 512);
 
 					if (write(fd, pad, pad_len) != pad_len)
 						ux_warn("TAR pad write failed\n");
 				}
+			} else {
+				ux_warn("cannot read '%s', skipping\n",
+					fullpath);
 			}
 		}
-
-		seqno++;
 	}
 
-	efs_closedir(sess, dirp);
+	free(entries);
 	return 0;
 }
 
@@ -2341,4 +2533,33 @@ int diag_efs_readlink_path(struct diag_session *sess, const char *path,
 	}
 
 	return efs_readlink(sess, path, buf, buf_size);
+}
+
+int diag_efs_get_item(struct diag_session *sess, const char *path,
+		      uint8_t *buf, size_t buf_size, int32_t *data_len_out)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_get_item(sess, path, buf, buf_size, data_len_out);
+}
+
+int diag_efs_put_item(struct diag_session *sess, const char *path,
+		      const uint8_t *data, int32_t data_len,
+		      int32_t flags, int32_t mode)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_put_item(sess, path, data, data_len, flags, mode);
 }

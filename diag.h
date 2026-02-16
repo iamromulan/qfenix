@@ -32,6 +32,7 @@
 
 /* EFS command codes */
 #define EFS2_DIAG_HELLO		0
+#define EFS2_DIAG_QUERY		1
 #define EFS2_DIAG_OPEN		2
 #define EFS2_DIAG_CLOSE		3
 #define EFS2_DIAG_READ		4
@@ -49,6 +50,10 @@
 #define EFS2_DIAG_MKDIR		9
 #define EFS2_DIAG_READLINK	14
 #define EFS2_DIAG_CHMOD		18
+
+/* EFS item interface commands (bypass file-level ACLs) */
+#define EFS2_DIAG_PUT		26
+#define EFS2_DIAG_GET		27
 
 /* EFS factory image commands */
 #define EFS2_DIAG_PREP_FACT_IMAGE	25
@@ -163,5 +168,12 @@ int diag_efs_ln(struct diag_session *sess, const char *target,
 		const char *linkpath);
 int diag_efs_readlink_path(struct diag_session *sess, const char *path,
 			   char *buf, size_t buf_size);
+
+/* EFS item interface (GET/PUT) — more permissive than file interface */
+int diag_efs_get_item(struct diag_session *sess, const char *path,
+		      uint8_t *buf, size_t buf_size, int32_t *data_len_out);
+int diag_efs_put_item(struct diag_session *sess, const char *path,
+		      const uint8_t *data, int32_t data_len,
+		      int32_t flags, int32_t mode);
 
 #endif
