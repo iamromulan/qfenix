@@ -3884,7 +3884,11 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 					plen = strnlen(pstart, raw_len);
 				}
 
-				paths[n] = strndup(pstart, plen);
+				paths[n] = malloc(plen + 1);
+				if (paths[n]) {
+					memcpy(paths[n], pstart, plen);
+					paths[n][plen] = '\0';
+				}
 				free(raw);
 				n++;
 			}
@@ -4246,7 +4250,6 @@ int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file)
 	uint8_t header[512];
 	int fd;
 	FILE *fp;
-	int file_count = 0;
 	int nv_count = 0;
 	int i;
 
@@ -4391,7 +4394,6 @@ int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file)
 			prov_count++;
 			break;
 		}
-		file_count++;
 	}
 
 	close(fd);
