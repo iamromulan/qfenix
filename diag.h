@@ -176,4 +176,36 @@ int diag_efs_put_item(struct diag_session *sess, const char *path,
 		      const uint8_t *data, int32_t data_len,
 		      int32_t flags, int32_t mode);
 
+/* Enhanced backup with probe walk */
+int diag_efs_backup_enhanced(struct diag_session *sess, const char *path,
+			     const char *output_file, bool quick);
+
+/* NV numbered item scanning */
+struct nv_scan_result {
+	struct nv_item *items;
+	int count;
+	int capacity;
+};
+
+int diag_nv_scan(struct diag_session *sess,
+		 struct nv_scan_result *def_items,
+		 struct nv_scan_result *sim1_items);
+void nv_scan_result_free(struct nv_scan_result *r);
+
+/* XQCN backup/restore */
+int diag_efs_backup_xqcn(struct diag_session *sess, const char *output_file);
+int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file);
+
+/* Offline XQCN <-> TAR conversion (no device needed) */
+int diag_xqcn_to_tar(const char *xqcn_file, const char *tar_file);
+int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file);
+
+/* DIAG feature query */
+int diag_feature_query(struct diag_session *sess, uint8_t *mask,
+		       size_t mask_size, size_t *mask_len);
+
+/* DIAG extended build ID */
+int diag_ext_build_id(struct diag_session *sess, char *model,
+		      size_t model_size);
+
 #endif

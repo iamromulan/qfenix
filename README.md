@@ -33,7 +33,8 @@ the original QDL:
   Auto-detected when `/dev/mhi_*` devices are present (`--pcie` flag optional).
 - **DIAG Protocol** - NV item read/write, full EFS filesystem management (list, pull,
   push, stat, mkdir, chmod, symlink, delete), factory image dump, EFS backup/restore
-  to standard TAR archives — all over the DIAG serial port.
+  to TAR archives or QPST-compatible XQCN format (with NV item scanning and
+  provisioning path probing for coverage exceeding QPST) — all over the DIAG serial port.
 - **Partition Erase** - Erase individual partitions by label (`erase`) or wipe all
   partitions at once (`eraseall`). The `flash -e` flag provides an atomic
   backup-erase-flash workflow: reads first, then erases all, then programs.
@@ -113,8 +114,10 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `efsln` | Create a symlink on EFS |
 | `efsrl` | Read a symlink target on EFS |
 | `efsdump` | Dump the EFS factory image |
-| `efsbackup` | Backup EFS filesystem to TAR archive |
-| `efsrestore` | Restore EFS filesystem from TAR archive |
+| `efsbackup` | Backup EFS filesystem to TAR or XQCN format |
+| `efsrestore` | Restore EFS filesystem from TAR or XQCN file |
+| `xqcn2tar` | Convert XQCN backup to TAR archive (offline) |
+| `tar2xqcn` | Convert TAR archive to XQCN format (offline) |
 
 **Other:**
 
@@ -248,11 +251,15 @@ qfenix efsdump efs_backup.bin
 
 ### EFS backup and restore
 
-Backup and restore the entire EFS filesystem as a standard TAR archive:
+Backup and restore the entire EFS filesystem. Default TAR backup probes known
+provisioning paths for comprehensive coverage beyond what directory walking finds:
 
 ```bash
-# Backup EFS to TAR (uses modem's built-in TAR generation)
+# Backup EFS to TAR (tree walk + probe for maximum coverage)
 qfenix efsbackup -o efs_backup.tar
+
+# Quick backup (tree walk only, faster but fewer files)
+qfenix efsbackup --quick -o efs_backup.tar
 
 # Backup a specific EFS subtree
 qfenix efsbackup -o nv_backup.tar /nv/item_files
@@ -262,6 +269,23 @@ qfenix efsbackup --manual -o efs_backup.tar
 
 # Restore EFS from a TAR archive
 qfenix efsrestore efs_backup.tar
+```
+
+### XQCN backup (QPST-compatible)
+
+Generate XQCN backups that exceed QPST's coverage. XQCN format includes NV
+numbered items, RF calibration data, and provisioning files in a single file:
+
+```bash
+# Backup to XQCN format (includes NV item scan + EFS files)
+qfenix efsbackup -x -o backup.xqcn
+
+# Restore from XQCN (auto-detected)
+qfenix efsrestore backup.xqcn
+
+# Offline format conversion (no device needed)
+qfenix xqcn2tar backup.xqcn output.tar
+qfenix tar2xqcn backup.tar output.xqcn
 ```
 
 ### GPT and partition operations
@@ -308,6 +332,9 @@ qfenix erase efs2 -L /path/to/firmware/
 
 # Erase multiple partitions
 qfenix erase efs2 efs3 modemst1 modemst2 -L /path/to/firmware/
+
+# Erase raw sectors by address (start sector + count)
+qfenix erase -L /path/to/firmware/ --start-sector=0 --num-sectors=1024
 
 # Erase all partitions on the device
 qfenix eraseall -L /path/to/firmware/

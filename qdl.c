@@ -781,8 +781,10 @@ static void print_usage(FILE *out)
 	fprintf(out, "  efsln         Create a symlink on EFS\n");
 	fprintf(out, "  efsrl         Read a symlink target on EFS\n");
 	fprintf(out, "  efsdump       Dump the EFS factory image\n");
-	fprintf(out, "  efsbackup     Backup EFS filesystem to TAR archive\n");
-	fprintf(out, "  efsrestore    Restore EFS filesystem from TAR archive\n");
+	fprintf(out, "  efsbackup     Backup EFS filesystem to TAR or XQCN format\n");
+	fprintf(out, "  efsrestore    Restore EFS filesystem from TAR or XQCN file\n");
+	fprintf(out, "  xqcn2tar      Convert XQCN backup to TAR archive (offline)\n");
+	fprintf(out, "  tar2xqcn      Convert TAR archive to XQCN format (offline)\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nOther Subcommands");
@@ -3228,9 +3230,11 @@ static int qdl_efsbackup(int argc, char **argv)
 {
 	struct diag_session *sess;
 	char *serial = NULL;
-	const char *output = "efs_backup.tar";
+	const char *output = NULL;
 	const char *path = "/";
 	bool manual = false;
+	bool xqcn = false;
+	bool quick = false;
 	int opt;
 	int ret;
 
@@ -3240,11 +3244,14 @@ static int qdl_efsbackup(int argc, char **argv)
 		{"serial", required_argument, 0, 'S'},
 		{"output", required_argument, 0, 'o'},
 		{"manual", no_argument, 0, 'm'},
+		{"xqcn", no_argument, 0, 'x'},
+		{"quick", no_argument, 0, 'q'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:o:mh", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:o:mxqh", options,
+				  NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -3261,16 +3268,27 @@ static int qdl_efsbackup(int argc, char **argv)
 		case 'm':
 			manual = true;
 			break;
+		case 'x':
+			xqcn = true;
+			break;
+		case 'q':
+			quick = true;
+			break;
 		case 'h':
 		default:
 			fprintf(stderr,
-				"Usage: qfenix efsbackup [-o output.tar] [--manual] [path] [--serial=S]\n"
-				"\nBackup EFS filesystem to a TAR archive.\n"
+				"Usage: qfenix efsbackup [-o FILE] [-x] [--quick] [path] [-S serial]\n"
+				"\nBackup EFS filesystem to TAR or XQCN format.\n"
 				"\nOptions:\n"
-				"  -o, --output=FILE   Output file (default: efs_backup.tar)\n"
+				"  -o, --output=FILE   Output file (default: efs_backup.tar or .xqcn)\n"
+				"  -x, --xqcn          Generate XQCN format (includes NV items)\n"
+				"  -q, --quick         Skip probe walk (tree walk only, faster)\n"
 				"  -m, --manual        Force manual tree walk (skip modem TAR generation)\n"
 				"  -S, --serial=S      Target device by serial/port\n"
 				"  -d, --debug         Print detailed debug info\n"
+				"\nDefault TAR backup always probes known paths for comprehensive coverage.\n"
+				"Use --quick to skip probing for fast tree-walk-only backup.\n"
+				"Use -x for QPST-compatible XQCN format (slower, scans NV items).\n"
 				"\nIf [path] is given, only that EFS subtree is backed up (default: /)\n");
 			return opt == 'h' ? 0 : 1;
 		}
@@ -3279,16 +3297,39 @@ static int qdl_efsbackup(int argc, char **argv)
 	if (optind < argc)
 		path = argv[optind];
 
+	if (!output)
+		output = xqcn ? "efs_backup.xqcn" : "efs_backup.tar";
+
 	sess = diag_open(serial);
 	if (!sess)
 		return 1;
 
 	diag_offline(sess);
-	ret = diag_efs_backup(sess, path, output, manual);
+
+	if (xqcn)
+		ret = diag_efs_backup_xqcn(sess, output);
+	else if (manual)
+		ret = diag_efs_backup(sess, path, output, true);
+	else
+		ret = diag_efs_backup_enhanced(sess, path, output, quick);
 
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static bool file_starts_with_xml(const char *path)
+{
+	char buf[8] = {0};
+	int fd;
+	ssize_t r;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	r = read(fd, buf, 5);
+	close(fd);
+	return r == 5 && memcmp(buf, "<?xml", 5) == 0;
 }
 
 static int qdl_efsrestore(int argc, char **argv)
@@ -3320,14 +3361,15 @@ static int qdl_efsrestore(int argc, char **argv)
 		case 'h':
 		default:
 			fprintf(stderr,
-				"Usage: qfenix efsrestore <input.tar> [--serial=S]\n"
-				"\nRestore EFS filesystem from a TAR archive.\n");
+				"Usage: qfenix efsrestore <input.tar|input.xqcn> [--serial=S]\n"
+				"\nRestore EFS filesystem from a TAR archive or XQCN file.\n"
+				"Format is auto-detected from file contents.\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
 	if (optind >= argc) {
-		fprintf(stderr, "Error: input TAR file required\n");
+		fprintf(stderr, "Error: input file required (TAR or XQCN)\n");
 		return 1;
 	}
 
@@ -3336,11 +3378,49 @@ static int qdl_efsrestore(int argc, char **argv)
 		return 1;
 
 	diag_offline(sess);
-	ret = diag_efs_restore(sess, argv[optind]);
+
+	if (file_starts_with_xml(argv[optind]))
+		ret = diag_efs_restore_xqcn(sess, argv[optind]);
+	else
+		ret = diag_efs_restore(sess, argv[optind]);
 
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static int qdl_xqcn2tar(int argc, char **argv)
+{
+	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
+	    strcmp(argv[1], "--help") == 0) {
+		fprintf(argc < 2 ? stderr : stdout,
+			"Usage: qfenix xqcn2tar <input.xqcn> [output.tar]\n"
+			"\nConvert XQCN backup to TAR archive (offline, no device needed).\n"
+			"NV items are stored as nv_items/NNNNN.bin in the TAR.\n");
+		return argc < 2 ? 1 : 0;
+	}
+
+	const char *input = argv[1];
+	const char *output = argc >= 3 ? argv[2] : "output.tar";
+
+	return !!diag_xqcn_to_tar(input, output);
+}
+
+static int qdl_tar2xqcn(int argc, char **argv)
+{
+	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
+	    strcmp(argv[1], "--help") == 0) {
+		fprintf(argc < 2 ? stderr : stdout,
+			"Usage: qfenix tar2xqcn <input.tar> [output.xqcn]\n"
+			"\nConvert TAR archive to XQCN format (offline, no device needed).\n"
+			"TAR entries under nv_items/ are converted to NV_ITEM_ARRAY.\n");
+		return argc < 2 ? 1 : 0;
+	}
+
+	const char *input = argv[1];
+	const char *output = argc >= 3 ? argv[2] : "output.xqcn";
+
+	return !!diag_tar_to_xqcn(input, output);
 }
 
 static int qdl_erase(int argc, char **argv)
@@ -3352,6 +3432,9 @@ static int qdl_erase(int argc, char **argv)
 	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
+	unsigned int start_sector = 0;
+	unsigned int num_sectors = 0;
+	bool raw_mode = false;
 	int opt;
 	int ret;
 	int i;
@@ -3364,11 +3447,14 @@ static int qdl_erase(int argc, char **argv)
 		{"storage", required_argument, 0, 's'},
 		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
+		{"start-sector", required_argument, 0, 'a'},
+		{"num-sectors", required_argument, 0, 'n'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Pa:n:h", options,
+				  NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -3389,29 +3475,59 @@ static int qdl_erase(int argc, char **argv)
 		case 'P':
 			use_pcie = true;
 			break;
+		case 'a':
+			start_sector = strtoul(optarg, NULL, 0);
+			raw_mode = true;
+			break;
+		case 'n':
+			num_sectors = strtoul(optarg, NULL, 0);
+			raw_mode = true;
+			break;
 		case 'h':
 		default:
 			fprintf(stderr,
-				"Usage: qfenix erase [-L dir | <programmer>] <label> [label2 ...] [--serial=S] [--storage=T] [--pcie]\n"
-				"\nErase one or more partitions by label.\n");
+				"Usage: qfenix erase [-L dir | <programmer>] <label> [label2 ...] [options]\n"
+				"       qfenix erase [-L dir | <programmer>] --start-sector=N --num-sectors=N [options]\n"
+				"\nErase partitions by label, or erase raw sectors by address.\n"
+				"\nOptions:\n"
+				"  -a, --start-sector=N  Start sector for raw erase\n"
+				"  -n, --num-sectors=N   Number of sectors to erase\n"
+				"  -s, --storage=TYPE    Storage type (ufs, emmc, nand)\n"
+				"  -S, --serial=S        Target device by serial/port\n"
+				"  -L, --find-loader=DIR Find programmer in directory\n"
+				"  -P, --pcie            Use PCIe transport\n"
+				"  -d, --debug           Print detailed debug info\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: no partition label(s) specified\n");
+	if (!raw_mode && optind >= argc) {
+		fprintf(stderr,
+			"Error: specify partition label(s) or"
+			" --start-sector + --num-sectors\n");
 		return 1;
 	}
 
-	if (!loader_dir && optind + 1 >= argc) {
+	if (raw_mode && !num_sectors) {
+		fprintf(stderr, "Error: --num-sectors is required"
+			" for raw sector erase\n");
+		return 1;
+	}
+
+	if (!loader_dir && !raw_mode && optind + 1 >= argc) {
 		/* Only labels, no programmer — try current dir */
+		loader_dir = ".";
+	}
+
+	if (!loader_dir && raw_mode && optind >= argc) {
 		loader_dir = ".";
 	}
 
 	if (loader_dir) {
 		programmer = find_programmer_recursive(loader_dir);
 		if (!programmer) {
-			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			fprintf(stderr, "Error: no programmer found in %s\n",
+				loader_dir);
 			return 1;
 		}
 		if (!storage_set)
@@ -3426,10 +3542,19 @@ static int qdl_erase(int argc, char **argv)
 		return 1;
 	}
 
-	for (i = optind; i < argc; i++) {
-		ret = gpt_erase_partition(qdl, argv[i]);
+	if (raw_mode) {
+		ux_info("erasing %u sectors starting at sector %u\n",
+			num_sectors, start_sector);
+		ret = firehose_erase_partition(qdl, 0, start_sector,
+					       num_sectors, 0);
 		if (ret)
 			failed++;
+	} else {
+		for (i = optind; i < argc; i++) {
+			ret = gpt_erase_partition(qdl, argv[i]);
+			if (ret)
+				failed++;
+		}
 	}
 
 	firehose_session_close(qdl, true);
@@ -3965,6 +4090,10 @@ int main(int argc, char **argv)
 		return qdl_efsbackup(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "efsrestore"))
 		return qdl_efsrestore(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "xqcn2tar"))
+		return qdl_xqcn2tar(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "tar2xqcn"))
+		return qdl_tar2xqcn(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "flash")) {
 		/*
 		 * "qfenix flash [options] [dir]" — treat bare positional

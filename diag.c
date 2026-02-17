@@ -10,10 +10,14 @@
 #include <unistd.h>
 
 #include "diag.h"
+#include "efs_paths.h"
 #include "hdlc.h"
 #include "usb_ids.h"
 #include "qdl.h"
 #include "oscompat.h"
+
+#include <libxml/parser.h>
+#include <libxml/tree.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -715,8 +719,8 @@ int diag_nv_read(struct diag_session *sess, uint16_t item,
 		return -1;
 
 	if (n < NV_ITEM_PKT_SIZE || resp[0] != DIAG_NV_READ_F) {
-		ux_err("NV read error: unexpected response (cmd=0x%02x, len=%d)\n",
-		       resp[0], n);
+		ux_debug("NV read: modem returned cmd=0x%02x len=%d"
+			 " (item not supported)\n", resp[0], n);
 		return -1;
 	}
 
@@ -788,7 +792,7 @@ int diag_nv_read_sub(struct diag_session *sess, uint16_t item,
 		return -1;
 
 	if (n < (int)sizeof(cmd) || resp[0] != DIAG_SUBSYS_CMD_F) {
-		ux_err("NV indexed read error: unexpected response\n");
+		ux_debug("NV indexed read: item not supported\n");
 		return -1;
 	}
 
@@ -2562,4 +2566,1983 @@ int diag_efs_put_item(struct diag_session *sess, const char *path,
 	}
 
 	return efs_put_item(sess, path, data, data_len, flags, mode);
+}
+
+/*
+ * DIAG feature query — retrieves modem feature bitmask.
+ * Command 0x51 (DIAG_FEATURE_QUERY), response contains mask.
+ */
+#define DIAG_FEATURE_QUERY_F	0x51
+
+int diag_feature_query(struct diag_session *sess, uint8_t *mask,
+		       size_t mask_size, size_t *mask_len)
+{
+	uint8_t cmd = DIAG_FEATURE_QUERY_F;
+	uint8_t resp[256];
+	int n;
+	uint16_t len;
+
+	n = diag_send(sess, &cmd, 1, resp, sizeof(resp));
+	if (n < 3 || resp[0] != DIAG_FEATURE_QUERY_F)
+		return -1;
+
+	len = resp[1] | (resp[2] << 8);
+	if (len > (uint16_t)(n - 3))
+		len = n - 3;
+	if (len > mask_size)
+		len = mask_size;
+
+	memcpy(mask, &resp[3], len);
+	if (mask_len)
+		*mask_len = len;
+
+	return 0;
+}
+
+/*
+ * DIAG extended build ID — retrieves modem model/build info.
+ * Command 0x7C returns build ID string.
+ */
+#define DIAG_EXT_BUILD_ID_F	0x7C
+
+int diag_ext_build_id(struct diag_session *sess, char *model,
+		      size_t model_size)
+{
+	uint8_t cmd = DIAG_EXT_BUILD_ID_F;
+	uint8_t resp[512];
+	int n;
+
+	n = diag_send(sess, &cmd, 1, resp, sizeof(resp));
+	if (n < 16 || resp[0] != DIAG_EXT_BUILD_ID_F)
+		return -1;
+
+	/*
+	 * Response layout:
+	 *   [0]     cmd echo
+	 *   [1..12] version info (MSM, mobile model, etc.)
+	 *   [13+]   null-terminated build ID string
+	 */
+	const char *build = (const char *)&resp[13];
+	size_t build_len = strnlen(build, n - 13);
+
+	if (build_len >= model_size)
+		build_len = model_size - 1;
+	memcpy(model, build, build_len);
+	model[build_len] = '\0';
+
+	return 0;
+}
+
+/*
+ * Path hash set for deduplication during probe walk.
+ * Simple open-addressing hash table with FNV-1a hash.
+ */
+struct path_set {
+	char **entries;
+	int capacity;
+	int count;
+};
+
+static uint32_t path_hash(const char *s)
+{
+	uint32_t h = 2166136261U;
+
+	while (*s) {
+		h ^= (uint8_t)*s++;
+		h *= 16777619U;
+	}
+	return h;
+}
+
+static void path_set_init(struct path_set *ps, int capacity)
+{
+	ps->capacity = capacity;
+	ps->count = 0;
+	ps->entries = calloc(capacity, sizeof(char *));
+}
+
+static void path_set_free(struct path_set *ps)
+{
+	int i;
+
+	for (i = 0; i < ps->capacity; i++)
+		free(ps->entries[i]);
+	free(ps->entries);
+	ps->entries = NULL;
+	ps->count = 0;
+}
+
+static bool path_set_contains(struct path_set *ps, const char *path)
+{
+	uint32_t idx = path_hash(path) % ps->capacity;
+	int i;
+
+	for (i = 0; i < ps->capacity; i++) {
+		uint32_t slot = (idx + i) % ps->capacity;
+
+		if (!ps->entries[slot])
+			return false;
+		if (strcmp(ps->entries[slot], path) == 0)
+			return true;
+	}
+	return false;
+}
+
+static void path_set_add(struct path_set *ps, const char *path)
+{
+	uint32_t idx;
+	int i;
+
+	if (path_set_contains(ps, path))
+		return;
+	if (ps->count >= ps->capacity * 3 / 4)
+		return; /* table too full, skip */
+
+	idx = path_hash(path) % ps->capacity;
+	for (i = 0; i < ps->capacity; i++) {
+		uint32_t slot = (idx + i) % ps->capacity;
+
+		if (!ps->entries[slot]) {
+			ps->entries[slot] = strdup(path);
+			ps->count++;
+			return;
+		}
+	}
+}
+
+/*
+ * efs_backup_tree_tracked() — same as efs_backup_tree() but records
+ * written paths into a path_set for later deduplication with probe walk.
+ */
+static int efs_backup_tree_tracked(struct diag_session *sess,
+				   const char *path, int fd,
+				   struct path_set *written)
+{
+	struct efs_dirent entry;
+	struct efs_stat st;
+	struct efs_entry_info *entries = NULL;
+	char fullpath[512];
+	char linkbuf[256];
+	int32_t dirp;
+	uint32_t seqno = 1;
+	int count = 0, capacity = 0;
+	int ret, i;
+
+	dirp = efs_opendir(sess, path);
+	if (dirp < 0) {
+		ux_err("cannot open EFS directory '%s'\n", path);
+		return -1;
+	}
+
+	for (;;) {
+		ret = efs_readdir(sess, dirp, seqno, &entry);
+		if (ret != 0)
+			break;
+
+		if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..")) {
+			seqno++;
+			continue;
+		}
+
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s",
+				 entry.name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entry.name);
+
+		if (efs_stat(sess, fullpath, &st) < 0) {
+			ux_warn("cannot stat '%s', skipping\n", fullpath);
+			seqno++;
+			continue;
+		}
+
+		if (count >= capacity) {
+			capacity = capacity ? capacity * 2 : 64;
+			entries = realloc(entries,
+					  capacity * sizeof(*entries));
+			if (!entries) {
+				efs_closedir(sess, dirp);
+				return -1;
+			}
+		}
+
+		strncpy(entries[count].name, entry.name,
+			sizeof(entries[count].name) - 1);
+		entries[count].name[sizeof(entries[count].name) - 1] = '\0';
+		entries[count].mode = st.mode;
+		entries[count].size = st.size;
+		entries[count].mtime = st.mtime;
+		count++;
+		seqno++;
+	}
+
+	efs_closedir(sess, dirp);
+
+	if (strcmp(path, "/") != 0) {
+		if (efs_stat(sess, path, &st) == 0) {
+			snprintf(fullpath, sizeof(fullpath), "%s/",
+				 path[0] == '/' ? path + 1 : path);
+			tar_write_header(fd, fullpath, st.mode, 0,
+					 st.mtime, '5', NULL);
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s",
+				 entries[i].name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entries[i].name);
+
+		const char *tar_path = fullpath[0] == '/' ?
+				       fullpath + 1 : fullpath;
+
+		if (S_ISDIR(entries[i].mode)) {
+			ret = efs_backup_tree_tracked(sess, fullpath,
+						      fd, written);
+			if (ret < 0)
+				ux_warn("failed to backup directory '%s'\n",
+					fullpath);
+		} else if (S_ISLNK(entries[i].mode)) {
+			if (efs_readlink(sess, fullpath, linkbuf,
+					 sizeof(linkbuf)) == 0) {
+				tar_write_header(fd, tar_path,
+						 entries[i].mode, 0,
+						 entries[i].mtime,
+						 '2', linkbuf);
+				path_set_add(written, fullpath);
+			}
+		} else {
+			int32_t fdata = efs_open(sess, fullpath,
+						 0 /* O_RDONLY */, 0);
+			if (fdata >= 0) {
+				uint8_t buf[EFS_MAX_READ_REQ];
+				uint32_t offset = 0;
+				int32_t remaining = entries[i].size;
+
+				tar_write_header(fd, tar_path,
+						 entries[i].mode,
+						 entries[i].size,
+						 entries[i].mtime,
+						 '0', NULL);
+
+				while (remaining > 0) {
+					uint32_t chunk = remaining >
+							 EFS_MAX_READ_REQ ?
+							 EFS_MAX_READ_REQ :
+							 remaining;
+					int n = efs_read(sess, fdata, chunk,
+							 offset, buf,
+							 sizeof(buf));
+					if (n <= 0)
+						break;
+					if (write(fd, buf, n) != n)
+						break;
+					offset += n;
+					remaining -= n;
+				}
+				efs_close(sess, fdata);
+
+				if (entries[i].size % 512) {
+					uint8_t pad[512] = {0};
+					int pad_len = 512 -
+						      (entries[i].size % 512);
+
+					if (write(fd, pad, pad_len) !=
+					    pad_len)
+						ux_warn("TAR pad write failed\n");
+				}
+				path_set_add(written, fullpath);
+			} else {
+				ux_warn("cannot read '%s', skipping\n",
+					fullpath);
+			}
+		}
+	}
+
+	free(entries);
+	return 0;
+}
+
+/*
+ * efs_probe_file() — probe a single EFS path and write to TAR if it exists
+ * and wasn't already captured by tree walk.
+ */
+static int efs_probe_file(struct diag_session *sess, const char *path,
+			  int fd, struct path_set *written)
+{
+	struct efs_stat st;
+	int32_t fdata;
+	uint8_t buf[EFS_MAX_READ_REQ];
+	uint32_t offset;
+	int32_t remaining;
+	int n;
+	const char *tar_path;
+
+	if (path_set_contains(written, path))
+		return 0;
+
+	if (efs_stat(sess, path, &st) < 0)
+		return 0; /* doesn't exist on this modem */
+
+	if (S_ISDIR(st.mode))
+		return 0;
+
+	fdata = efs_open(sess, path, 0 /* O_RDONLY */, 0);
+	if (fdata < 0)
+		return 0;
+
+	tar_path = path[0] == '/' ? path + 1 : path;
+	tar_write_header(fd, tar_path, st.mode, st.size, st.mtime, '0', NULL);
+
+	offset = 0;
+	remaining = st.size;
+	while (remaining > 0) {
+		uint32_t chunk = remaining > EFS_MAX_READ_REQ ?
+				 EFS_MAX_READ_REQ : remaining;
+
+		n = efs_read(sess, fdata, chunk, offset, buf, sizeof(buf));
+		if (n <= 0)
+			break;
+		if (write(fd, buf, n) != n)
+			break;
+		offset += n;
+		remaining -= n;
+	}
+	efs_close(sess, fdata);
+
+	if (st.size % 512) {
+		uint8_t pad[512] = {0};
+		int pad_len = 512 - (st.size % 512);
+
+		if (write(fd, pad, pad_len) != pad_len)
+			ux_warn("TAR pad write failed\n");
+	}
+
+	path_set_add(written, path);
+	return 1;
+}
+
+/*
+ * Enhanced EFS backup: tree walk + probe walk.
+ * Captures both visible files (readdir) and virtual NV item files
+ * (invisible to readdir but accessible by direct path).
+ */
+int diag_efs_backup_enhanced(struct diag_session *sess, const char *path,
+			     const char *output_file, bool quick)
+{
+	struct path_set written;
+	int fd;
+	int ret;
+	int n;
+	int probe_count = 0;
+	int i;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+	if (fd < 0) {
+		ux_err("cannot create %s: %s\n", output_file, strerror(errno));
+		return -1;
+	}
+
+	path_set_init(&written, 4096);
+
+	/* Phase 1: tree walk (discovers device-specific files) */
+	ux_info("backing up EFS '%s' via tree walk to %s\n", path, output_file);
+	ret = efs_backup_tree_tracked(sess, path, fd, &written);
+	if (ret < 0) {
+		ux_err("tree walk failed\n");
+		close(fd);
+		path_set_free(&written);
+		return -1;
+	}
+
+	ux_info("tree walk: %d files captured\n", written.count);
+
+	if (!quick) {
+		/* Phase 2: probe static EFS_Backup paths */
+		ux_info("probing known provisioning paths...\n");
+		for (i = 0; efs_backup_static_paths[i]; i++) {
+			if (efs_probe_file(sess, efs_backup_static_paths[i],
+					   fd, &written))
+				probe_count++;
+		}
+
+		/* Phase 3: probe rfnv range dynamically */
+		ux_info("probing rfnv range %d-%d...\n",
+			RFNV_ID_MIN, RFNV_ID_MAX);
+		for (i = RFNV_ID_MIN; i <= RFNV_ID_MAX; i++) {
+			char rfpath[64];
+
+			snprintf(rfpath, sizeof(rfpath),
+				 "/nv/item_files/rfnv/%08d", i);
+			if (efs_probe_file(sess, rfpath, fd, &written))
+				probe_count++;
+
+			if ((i - RFNV_ID_MIN) % 1000 == 0 && i > RFNV_ID_MIN)
+				ux_progress("rfnv probe",
+					    i - RFNV_ID_MIN,
+					    RFNV_ID_MAX - RFNV_ID_MIN);
+		}
+
+		/* Phase 4: probe provisioning paths */
+		ux_info("probing provisioning paths...\n");
+		for (i = 0; provisioning_paths[i]; i++) {
+			if (efs_probe_file(sess, provisioning_paths[i],
+					   fd, &written))
+				probe_count++;
+
+			if (i % 100 == 0 && i > 0) {
+				int total = 0;
+
+				while (provisioning_paths[total])
+					total++;
+				ux_progress("provisioning probe", i, total);
+			}
+		}
+
+		ux_info("probe walk: %d additional files found\n",
+			probe_count);
+	}
+
+	/* Write two zero blocks to end TAR archive */
+	{
+		uint8_t zeros[1024] = {0};
+
+		if (write(fd, zeros, 1024) != 1024)
+			ret = -1;
+	}
+
+	ux_info("EFS backup complete: %d files total in %s\n",
+		written.count, output_file);
+
+	close(fd);
+	path_set_free(&written);
+	return ret;
+}
+
+/*
+ * NV numbered item scanning.
+ */
+void nv_scan_result_free(struct nv_scan_result *r)
+{
+	free(r->items);
+	r->items = NULL;
+	r->count = 0;
+	r->capacity = 0;
+}
+
+static void nv_scan_add(struct nv_scan_result *r, const struct nv_item *item)
+{
+	if (r->count >= r->capacity) {
+		r->capacity = r->capacity ? r->capacity * 2 : 256;
+		r->items = realloc(r->items, r->capacity * sizeof(*r->items));
+	}
+	memcpy(&r->items[r->count], item, sizeof(*item));
+	r->count++;
+}
+
+int diag_nv_scan(struct diag_session *sess,
+		 struct nv_scan_result *def_items,
+		 struct nv_scan_result *sim1_items)
+{
+	struct nv_item item;
+	int i;
+
+	memset(def_items, 0, sizeof(*def_items));
+	memset(sim1_items, 0, sizeof(*sim1_items));
+
+	ux_info("scanning NV items 0-%d...\n", NV_SCAN_MAX_ID);
+
+	/* Scan default subscription */
+	for (i = 0; i <= NV_SCAN_MAX_ID; i++) {
+		if (diag_nv_read(sess, (uint16_t)i, &item) == 0 &&
+		    item.status == NV_DONE_S)
+			nv_scan_add(def_items, &item);
+
+		ux_progress("NV default", i, NV_SCAN_MAX_ID);
+	}
+
+	ux_info("default subscription: %d active NV items\n", def_items->count);
+
+	/* Scan SIM_1 subscription (index 1) */
+	for (i = 0; i <= NV_SCAN_MAX_ID; i++) {
+		if (diag_nv_read_sub(sess, (uint16_t)i, 1, &item) == 0 &&
+		    item.status == NV_DONE_S)
+			nv_scan_add(sim1_items, &item);
+
+		ux_progress("NV SIM_1", i, NV_SCAN_MAX_ID);
+	}
+
+	ux_info("SIM_1 subscription: %d active NV items\n", sim1_items->count);
+
+	return 0;
+}
+
+/*
+ * XQCN file data — collected EFS files + metadata for XQCN generation.
+ */
+struct efs_file_entry {
+	char path[512];
+	uint8_t *data;
+	int32_t size;
+	int32_t mode;
+};
+
+struct xqcn_efs_data {
+	struct efs_file_entry *files;
+	int count;
+	int capacity;
+};
+
+static void xqcn_efs_free(struct xqcn_efs_data *d)
+{
+	int i;
+
+	for (i = 0; i < d->count; i++)
+		free(d->files[i].data);
+	free(d->files);
+	d->files = NULL;
+	d->count = 0;
+}
+
+static int xqcn_efs_add(struct xqcn_efs_data *d, struct diag_session *sess,
+			 const char *path, struct path_set *seen)
+{
+	struct efs_stat st;
+	int32_t fdata;
+	uint8_t *buf;
+	uint32_t offset;
+	int32_t remaining;
+	int n;
+
+	if (path_set_contains(seen, path))
+		return 0;
+
+	if (efs_stat(sess, path, &st) < 0)
+		return 0;
+
+	if (S_ISDIR(st.mode))
+		return 0;
+
+	fdata = efs_open(sess, path, 0 /* O_RDONLY */, 0);
+	if (fdata < 0)
+		return 0;
+
+	buf = malloc(st.size > 0 ? st.size : 1);
+	if (!buf) {
+		efs_close(sess, fdata);
+		return 0;
+	}
+
+	offset = 0;
+	remaining = st.size;
+	while (remaining > 0) {
+		uint8_t tmp[EFS_MAX_READ_REQ];
+		uint32_t chunk = remaining > EFS_MAX_READ_REQ ?
+				 EFS_MAX_READ_REQ : remaining;
+
+		n = efs_read(sess, fdata, chunk, offset, tmp, sizeof(tmp));
+		if (n <= 0)
+			break;
+		memcpy(buf + offset, tmp, n);
+		offset += n;
+		remaining -= n;
+	}
+	efs_close(sess, fdata);
+
+	if (d->count >= d->capacity) {
+		d->capacity = d->capacity ? d->capacity * 2 : 256;
+		d->files = realloc(d->files,
+				   d->capacity * sizeof(*d->files));
+	}
+
+	strncpy(d->files[d->count].path, path,
+		sizeof(d->files[d->count].path) - 1);
+	d->files[d->count].path[sizeof(d->files[d->count].path) - 1] = '\0';
+	d->files[d->count].data = buf;
+	d->files[d->count].size = offset;
+	d->files[d->count].mode = st.mode;
+	d->count++;
+
+	path_set_add(seen, path);
+	return 1;
+}
+
+/*
+ * Collect EFS files by walking tree + probing known paths.
+ */
+static int xqcn_collect_tree(struct diag_session *sess, const char *path,
+			     struct xqcn_efs_data *d, struct path_set *seen)
+{
+	struct efs_dirent entry;
+	struct efs_stat st;
+	struct efs_entry_info *entries = NULL;
+	char fullpath[512];
+	int32_t dirp;
+	uint32_t seqno = 1;
+	int count = 0, capacity = 0;
+	int ret, i;
+
+	dirp = efs_opendir(sess, path);
+	if (dirp < 0)
+		return -1;
+
+	for (;;) {
+		ret = efs_readdir(sess, dirp, seqno, &entry);
+		if (ret != 0)
+			break;
+
+		if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..")) {
+			seqno++;
+			continue;
+		}
+
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s",
+				 entry.name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entry.name);
+
+		if (efs_stat(sess, fullpath, &st) < 0) {
+			seqno++;
+			continue;
+		}
+
+		if (count >= capacity) {
+			capacity = capacity ? capacity * 2 : 64;
+			entries = realloc(entries,
+					  capacity * sizeof(*entries));
+			if (!entries) {
+				efs_closedir(sess, dirp);
+				return -1;
+			}
+		}
+
+		strncpy(entries[count].name, entry.name,
+			sizeof(entries[count].name) - 1);
+		entries[count].name[sizeof(entries[count].name) - 1] = '\0';
+		entries[count].mode = st.mode;
+		entries[count].size = st.size;
+		entries[count].mtime = st.mtime;
+		count++;
+		seqno++;
+	}
+
+	efs_closedir(sess, dirp);
+
+	for (i = 0; i < count; i++) {
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s",
+				 entries[i].name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entries[i].name);
+
+		if (S_ISDIR(entries[i].mode))
+			xqcn_collect_tree(sess, fullpath, d, seen);
+		else if (!S_ISLNK(entries[i].mode))
+			xqcn_efs_add(d, sess, fullpath, seen);
+	}
+
+	free(entries);
+	return 0;
+}
+
+/*
+ * Write hex-encoded stream data to XQCN file.
+ */
+static void xqcn_write_hex(FILE *fp, const uint8_t *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (i > 0)
+			fprintf(fp, " ");
+		fprintf(fp, "%02X", data[i]);
+	}
+}
+
+/*
+ * Build EFS_Backup dir entry: 8-byte header + null-terminated path.
+ * Header: 01 00 01 01 + 4 bytes (mode as uint32_t LE).
+ */
+static void xqcn_write_backup_dir_entry(FILE *fp, int idx,
+					 const char *path, int32_t mode)
+{
+	uint8_t header[8] = {0x01, 0x00, 0x01, 0x01, 0, 0, 0, 0};
+	size_t path_len = strlen(path) + 1; /* include null */
+	size_t total = 8 + path_len;
+
+	memcpy(&header[4], &mode, 4);
+
+	fprintf(fp, "          <Stream Length='%zu' Name='%08X' Value='",
+		total, idx);
+	xqcn_write_hex(fp, header, 8);
+	fprintf(fp, " ");
+	xqcn_write_hex(fp, (const uint8_t *)path, path_len);
+	fprintf(fp, "'/>\n");
+}
+
+/*
+ * Build Provisioning dir entry: raw null-terminated path.
+ */
+static void xqcn_write_prov_dir_entry(FILE *fp, int idx, const char *path)
+{
+	size_t path_len = strlen(path) + 1;
+
+	fprintf(fp, "          <Stream Length='%zu' Name='%08X' Value='",
+		path_len, idx);
+	xqcn_write_hex(fp, (const uint8_t *)path, path_len);
+	fprintf(fp, "'/>\n");
+}
+
+/*
+ * Write file data stream.
+ */
+static void xqcn_write_data_entry(FILE *fp, int idx,
+				   const uint8_t *data, int32_t size)
+{
+	fprintf(fp, "          <Stream Length='%d' Name='%08X' Value='",
+		size, idx);
+	xqcn_write_hex(fp, data, size);
+	fprintf(fp, "'/>\n");
+}
+
+int diag_efs_backup_xqcn(struct diag_session *sess, const char *output_file)
+{
+	struct nv_scan_result def_nv = {0}, sim1_nv = {0};
+	struct xqcn_efs_data efs_data = {0};
+	struct path_set seen;
+	uint8_t feature_mask[128];
+	size_t fm_len = 0;
+	char model[256] = {0};
+	FILE *fp;
+	int i, idx;
+	int backup_count = 0, prov_count = 0, nvitems_count = 0;
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	/* Step 1: Scan NV numbered items */
+	diag_nv_scan(sess, &def_nv, &sim1_nv);
+
+	/* Step 2: Collect EFS files */
+	path_set_init(&seen, 4096);
+
+	ux_info("collecting EFS files via tree walk...\n");
+	xqcn_collect_tree(sess, "/", &efs_data, &seen);
+	ux_info("tree walk: %d files\n", efs_data.count);
+
+	/* Probe static EFS_Backup paths */
+	for (i = 0; efs_backup_static_paths[i]; i++)
+		xqcn_efs_add(&efs_data, sess, efs_backup_static_paths[i],
+			      &seen);
+
+	/* Probe rfnv range */
+	ux_info("probing rfnv range %d-%d...\n", RFNV_ID_MIN, RFNV_ID_MAX);
+	for (i = RFNV_ID_MIN; i <= RFNV_ID_MAX; i++) {
+		char rfpath[64];
+
+		snprintf(rfpath, sizeof(rfpath),
+			 "/nv/item_files/rfnv/%08d", i);
+		xqcn_efs_add(&efs_data, sess, rfpath, &seen);
+
+		if ((i - RFNV_ID_MIN) % 1000 == 0 && i > RFNV_ID_MIN)
+			ux_progress("rfnv probe", i - RFNV_ID_MIN,
+				    RFNV_ID_MAX - RFNV_ID_MIN);
+	}
+
+	/* Probe provisioning paths */
+	ux_info("probing provisioning paths...\n");
+	for (i = 0; provisioning_paths[i]; i++)
+		xqcn_efs_add(&efs_data, sess, provisioning_paths[i], &seen);
+
+	ux_info("total EFS files collected: %d\n", efs_data.count);
+
+	/* Step 3: Get metadata */
+	if (diag_feature_query(sess, feature_mask, sizeof(feature_mask),
+			       &fm_len) < 0) {
+		fm_len = 0;
+		ux_warn("feature query failed, using empty mask\n");
+	}
+
+	if (diag_ext_build_id(sess, model, sizeof(model)) < 0) {
+		strncpy(model, "Unknown", sizeof(model) - 1);
+		ux_warn("build ID query failed\n");
+	}
+
+	/* Step 4: Write XQCN XML */
+	fp = fopen(output_file, "w");
+	if (!fp) {
+		ux_err("cannot create %s: %s\n", output_file,
+		       strerror(errno));
+		nv_scan_result_free(&def_nv);
+		nv_scan_result_free(&sim1_nv);
+		xqcn_efs_free(&efs_data);
+		path_set_free(&seen);
+		return -1;
+	}
+
+	fprintf(fp, "<?xml version=\"1.0\" encoding=\"Windows-1252\" ?>\n");
+	fprintf(fp, "<Storage Name='%s'>\n",
+		strrchr(output_file, '/') ?
+		strrchr(output_file, '/') + 1 : output_file);
+	fprintf(fp, "  <Storage Name='00000000'>\n");
+	fprintf(fp, "    <Storage Name='default'>\n");
+
+	/* NV_NUMBERED_ITEMS */
+	fprintf(fp, "      <Storage Name='NV_NUMBERED_ITEMS'>\n");
+
+	/* NV_ITEM_ARRAY (default subscription) */
+	{
+		size_t arr_len = def_nv.count * XQCN_NV_RECORD_SIZE;
+
+		fprintf(fp, "        <Stream Length='%zu'"
+			" Name='NV_ITEM_ARRAY' Value='", arr_len);
+		for (i = 0; i < def_nv.count; i++) {
+			uint8_t rec[XQCN_NV_RECORD_SIZE];
+			uint16_t rsize = XQCN_NV_RECORD_SIZE;
+			uint16_t sub = 0x0001;
+			uint32_t nv_id = def_nv.items[i].item;
+
+			memset(rec, 0, sizeof(rec));
+			memcpy(&rec[0], &rsize, 2);
+			memcpy(&rec[2], &sub, 2);
+			memcpy(&rec[4], &nv_id, 4);
+			memcpy(&rec[8], def_nv.items[i].data,
+			       NV_ITEM_DATA_SIZE);
+
+			if (i > 0)
+				fprintf(fp, " ");
+			xqcn_write_hex(fp, rec, XQCN_NV_RECORD_SIZE);
+		}
+		fprintf(fp, "'/>\n");
+	}
+
+	/* NV_ITEM_ARRAY_SIM_1 */
+	{
+		size_t arr_len = sim1_nv.count * XQCN_NV_RECORD_SIZE;
+
+		fprintf(fp, "        <Stream Length='%zu'"
+			" Name='NV_ITEM_ARRAY_SIM_1' Value='", arr_len);
+		for (i = 0; i < sim1_nv.count; i++) {
+			uint8_t rec[XQCN_NV_RECORD_SIZE];
+			uint16_t rsize = XQCN_NV_RECORD_SIZE;
+			uint16_t sub = 0x0001;
+			uint32_t nv_id = sim1_nv.items[i].item;
+
+			memset(rec, 0, sizeof(rec));
+			memcpy(&rec[0], &rsize, 2);
+			memcpy(&rec[2], &sub, 2);
+			memcpy(&rec[4], &nv_id, 4);
+			memcpy(&rec[8], sim1_nv.items[i].data,
+			       NV_ITEM_DATA_SIZE);
+
+			if (i > 0)
+				fprintf(fp, " ");
+			xqcn_write_hex(fp, rec, XQCN_NV_RECORD_SIZE);
+		}
+		fprintf(fp, "'/>\n");
+	}
+
+	/* NV_ITEM_ARRAY_SIM_2 (empty) */
+	fprintf(fp, "        <Stream Length='0'"
+		" Name='NV_ITEM_ARRAY_SIM_2' Value=''/>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/*
+	 * EFS_Backup section (rfnv + rfc/static paths — 8-byte header).
+	 * QPST puts rfc paths in BOTH EFS_Backup and NV_Items for
+	 * restore redundancy (file API + item API). We match this.
+	 */
+	fprintf(fp, "      <Storage Name='EFS_Backup'>\n");
+	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		int sec = efs_path_xqcn_section(efs_data.files[i].path);
+
+		if (sec == XQCN_SECTION_BACKUP ||
+		    sec == XQCN_SECTION_NVITEMS) {
+			xqcn_write_backup_dir_entry(fp, idx,
+						    efs_data.files[i].path,
+						    efs_data.files[i].mode);
+			idx++;
+		}
+	}
+	backup_count = idx;
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		int sec = efs_path_xqcn_section(efs_data.files[i].path);
+
+		if (sec == XQCN_SECTION_BACKUP ||
+		    sec == XQCN_SECTION_NVITEMS) {
+			xqcn_write_data_entry(fp, idx,
+					      efs_data.files[i].data,
+					      efs_data.files[i].size);
+			idx++;
+		}
+	}
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/* Provisioning_Item_Files section (config paths — raw path) */
+	fprintf(fp, "      <Storage Name='Provisioning_Item_Files'>\n");
+	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		if (efs_path_xqcn_section(efs_data.files[i].path) ==
+		    XQCN_SECTION_PROV) {
+			xqcn_write_prov_dir_entry(fp, idx,
+						  efs_data.files[i].path);
+			idx++;
+		}
+	}
+	prov_count = idx;
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		if (efs_path_xqcn_section(efs_data.files[i].path) ==
+		    XQCN_SECTION_PROV) {
+			xqcn_write_data_entry(fp, idx,
+					      efs_data.files[i].data,
+					      efs_data.files[i].size);
+			idx++;
+		}
+	}
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/* NV_Items section (RFC/calibration — raw path) */
+	fprintf(fp, "      <Storage Name='NV_Items'>\n");
+	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		if (efs_path_xqcn_section(efs_data.files[i].path) ==
+		    XQCN_SECTION_NVITEMS) {
+			xqcn_write_prov_dir_entry(fp, idx,
+						  efs_data.files[i].path);
+			idx++;
+		}
+	}
+	nvitems_count = idx;
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+	idx = 0;
+	for (i = 0; i < efs_data.count; i++) {
+		if (efs_path_xqcn_section(efs_data.files[i].path) ==
+		    XQCN_SECTION_NVITEMS) {
+			xqcn_write_data_entry(fp, idx,
+					      efs_data.files[i].data,
+					      efs_data.files[i].size);
+			idx++;
+		}
+	}
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/* Mobile_Property_Info */
+	{
+		uint8_t mpi[512];
+		size_t mpi_len;
+		uint32_t magic = XQCN_MPI_MAGIC;
+		uint32_t reserved = 0;
+		uint16_t model_len = strlen(model);
+		const char *tool = "QFenix";
+		uint16_t tool_len = strlen(tool);
+
+		memset(mpi, 0, sizeof(mpi));
+		memcpy(&mpi[0], &magic, 4);
+		memcpy(&mpi[4], &reserved, 4);
+		memcpy(&mpi[8], &model_len, 2);
+		memcpy(&mpi[10], model, model_len);
+		memcpy(&mpi[10 + model_len], &tool_len, 2);
+		memcpy(&mpi[12 + model_len], tool, tool_len);
+		mpi_len = 12 + model_len + tool_len;
+
+		fprintf(fp, "      <Stream Length='%zu'"
+			" Name='Mobile_Property_Info' Value='",
+			mpi_len);
+		xqcn_write_hex(fp, mpi, mpi_len);
+		fprintf(fp, "'/>\n");
+	}
+
+	/* Feature_Mask */
+	if (fm_len > 0) {
+		uint8_t fm_buf[256];
+		uint16_t fm_data_len = fm_len;
+		size_t total = 2 + fm_len;
+
+		memcpy(&fm_buf[0], &fm_data_len, 2);
+		memcpy(&fm_buf[2], feature_mask, fm_len);
+		fprintf(fp, "      <Stream Length='%zu'"
+			" Name='Feature_Mask' Value='", total);
+		xqcn_write_hex(fp, fm_buf, total);
+		fprintf(fp, "'/>\n");
+	}
+
+	fprintf(fp, "    </Storage>\n");
+	fprintf(fp, "  </Storage>\n");
+
+	/* File_Version */
+	{
+		uint8_t fv[6] = {0};
+		uint32_t version = XQCN_FILE_VERSION;
+
+		memcpy(fv, &version, 4);
+		fprintf(fp, "  <Stream Length='6'"
+			" Name='File_Version' Value='");
+		xqcn_write_hex(fp, fv, 6);
+		fprintf(fp, "'/>\n");
+	}
+
+	fprintf(fp, "</Storage>\n");
+	fclose(fp);
+
+	ux_info("XQCN backup complete: %s\n", output_file);
+	ux_info("  NV items: %d default, %d SIM_1\n",
+		def_nv.count, sim1_nv.count);
+	ux_info("  EFS files: %d backup, %d provisioning, %d nv_items\n",
+		backup_count, prov_count, nvitems_count);
+
+	nv_scan_result_free(&def_nv);
+	nv_scan_result_free(&sim1_nv);
+	xqcn_efs_free(&efs_data);
+	path_set_free(&seen);
+	return 0;
+}
+
+/*
+ * Parse hex string from XQCN XML Value attribute.
+ * Returns allocated buffer and sets *out_len. Caller frees.
+ */
+static uint8_t *xqcn_parse_hex(const char *hex_str, size_t *out_len)
+{
+	size_t slen, blen;
+	uint8_t *buf;
+	size_t i, j;
+
+	if (!hex_str || !*hex_str) {
+		*out_len = 0;
+		return NULL;
+	}
+
+	slen = strlen(hex_str);
+	blen = (slen + 1) / 3 + 1; /* rough upper bound */
+	buf = malloc(blen);
+	if (!buf) {
+		*out_len = 0;
+		return NULL;
+	}
+
+	j = 0;
+	for (i = 0; i < slen;) {
+		unsigned int byte;
+		char hex_pair[3];
+
+		while (i < slen && hex_str[i] == ' ')
+			i++;
+		if (i + 1 >= slen)
+			break;
+		hex_pair[0] = hex_str[i];
+		hex_pair[1] = hex_str[i + 1];
+		hex_pair[2] = '\0';
+		if (sscanf(hex_pair, "%x", &byte) != 1)
+			break;
+		buf[j++] = (uint8_t)byte;
+		i += 2;
+	}
+
+	*out_len = j;
+	return buf;
+}
+
+/*
+ * XQCN restore — parse XQCN XML and restore NV items + EFS files.
+ */
+int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
+{
+	xmlDocPtr doc;
+	xmlNodePtr root, sub0, def_node, section, child, stream;
+	int nv_written = 0, efs_written = 0;
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	doc = xmlParseFile(xqcn_file);
+	if (!doc) {
+		ux_err("cannot parse XQCN file: %s\n", xqcn_file);
+		return -1;
+	}
+
+	root = xmlDocGetRootElement(doc);
+	if (!root) {
+		ux_err("empty XQCN document\n");
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	/* Navigate: root -> 00000000 -> default */
+	sub0 = NULL;
+	for (xmlNodePtr c = root->children; c; c = c->next) {
+		if (c->type == XML_ELEMENT_NODE &&
+		    !strcmp((char *)c->name, "Storage")) {
+			sub0 = c;
+			break;
+		}
+	}
+	if (!sub0) {
+		ux_err("XQCN: missing subscription storage\n");
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	def_node = NULL;
+	for (xmlNodePtr c = sub0->children; c; c = c->next) {
+		if (c->type == XML_ELEMENT_NODE &&
+		    !strcmp((char *)c->name, "Storage")) {
+			def_node = c;
+			break;
+		}
+	}
+	if (!def_node) {
+		ux_err("XQCN: missing default storage\n");
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	ux_info("restoring from XQCN: %s\n", xqcn_file);
+
+	/* Process each section */
+	for (section = def_node->children; section; section = section->next) {
+		xmlChar *name;
+
+		if (section->type != XML_ELEMENT_NODE)
+			continue;
+
+		name = xmlGetProp(section, (const xmlChar *)"Name");
+		if (!name)
+			continue;
+
+		/* NV_NUMBERED_ITEMS */
+		if (!strcmp((char *)name, "NV_NUMBERED_ITEMS") &&
+		    !strcmp((char *)section->name, "Storage")) {
+			for (stream = section->children; stream;
+			     stream = stream->next) {
+				xmlChar *sname, *val;
+				uint8_t *data;
+				size_t data_len;
+				size_t off;
+
+				if (stream->type != XML_ELEMENT_NODE)
+					continue;
+
+				sname = xmlGetProp(stream,
+						   (const xmlChar *)"Name");
+				if (!sname)
+					continue;
+
+				/* Only restore default NV_ITEM_ARRAY */
+				if (strcmp((char *)sname,
+					   "NV_ITEM_ARRAY") != 0) {
+					xmlFree(sname);
+					continue;
+				}
+				xmlFree(sname);
+
+				val = xmlGetProp(stream,
+						 (const xmlChar *)"Value");
+				if (!val)
+					continue;
+
+				data = xqcn_parse_hex((char *)val, &data_len);
+				xmlFree(val);
+				if (!data)
+					continue;
+
+				for (off = 0;
+				     off + XQCN_NV_RECORD_SIZE <= data_len;
+				     off += XQCN_NV_RECORD_SIZE) {
+					uint32_t nv_id;
+					uint16_t item_id;
+
+					memcpy(&nv_id, &data[off + 4], 4);
+					item_id = (uint16_t)nv_id;
+					if (diag_nv_write(sess, item_id,
+							  &data[off + 8],
+							  NV_ITEM_DATA_SIZE)
+					    == 0) {
+						nv_written++;
+						ux_debug("NV %d written\n",
+							 item_id);
+					}
+				}
+				free(data);
+			}
+		}
+
+		/* EFS sections: EFS_Backup, Provisioning, NV_Items */
+		if ((!strcmp((char *)name, "EFS_Backup") ||
+		     !strcmp((char *)name, "Provisioning_Item_Files") ||
+		     !strcmp((char *)name, "NV_Items")) &&
+		    !strcmp((char *)section->name, "Storage")) {
+			xmlNodePtr dir_node = NULL, data_node = NULL;
+			bool is_backup = !strcmp((char *)name, "EFS_Backup");
+			int entry_count = 0;
+			char **paths = NULL;
+			uint8_t **datas = NULL;
+			size_t *sizes = NULL;
+
+			for (child = section->children; child;
+			     child = child->next) {
+				xmlChar *cname;
+
+				if (child->type != XML_ELEMENT_NODE)
+					continue;
+				cname = xmlGetProp(child,
+						   (const xmlChar *)"Name");
+				if (!cname)
+					continue;
+				if (!strcmp((char *)cname, "EFS_Dir"))
+					dir_node = child;
+				else if (!strcmp((char *)cname, "EFS_Data"))
+					data_node = child;
+				xmlFree(cname);
+			}
+
+			if (!dir_node || !data_node) {
+				xmlFree(name);
+				continue;
+			}
+
+			/* Count entries in dir_node */
+			for (stream = dir_node->children; stream;
+			     stream = stream->next) {
+				if (stream->type == XML_ELEMENT_NODE)
+					entry_count++;
+			}
+
+			if (entry_count == 0) {
+				xmlFree(name);
+				continue;
+			}
+
+			paths = calloc(entry_count, sizeof(char *));
+			datas = calloc(entry_count, sizeof(uint8_t *));
+			sizes = calloc(entry_count, sizeof(size_t));
+
+			/* Parse dir entries */
+			n = 0;
+			for (stream = dir_node->children; stream;
+			     stream = stream->next) {
+				xmlChar *val;
+				uint8_t *raw;
+				size_t raw_len;
+				const char *pstart;
+				size_t plen;
+
+				if (stream->type != XML_ELEMENT_NODE ||
+				    n >= entry_count)
+					continue;
+
+				val = xmlGetProp(stream,
+						 (const xmlChar *)"Value");
+				if (!val)
+					continue;
+
+				raw = xqcn_parse_hex((char *)val, &raw_len);
+				xmlFree(val);
+				if (!raw)
+					continue;
+
+				if (is_backup && raw_len > 8) {
+					/* 8-byte header + path */
+					pstart = (char *)raw + 8;
+					plen = strnlen(pstart, raw_len - 8);
+				} else {
+					/* raw null-terminated path */
+					pstart = (char *)raw;
+					plen = strnlen(pstart, raw_len);
+				}
+
+				paths[n] = strndup(pstart, plen);
+				free(raw);
+				n++;
+			}
+
+			/* Parse data entries */
+			n = 0;
+			for (stream = data_node->children; stream;
+			     stream = stream->next) {
+				xmlChar *val;
+
+				if (stream->type != XML_ELEMENT_NODE ||
+				    n >= entry_count)
+					continue;
+
+				val = xmlGetProp(stream,
+						 (const xmlChar *)"Value");
+				if (!val)
+					continue;
+
+				datas[n] = xqcn_parse_hex((char *)val,
+							  &sizes[n]);
+				xmlFree(val);
+				n++;
+			}
+
+			/* Write files to EFS */
+			for (n = 0; n < entry_count; n++) {
+				int32_t fdata;
+				uint32_t off = 0;
+				size_t rem;
+
+				if (!paths[n] || !datas[n])
+					continue;
+
+				fdata = efs_open(sess, paths[n], 0x301,
+						 0x1FF);
+				if (fdata < 0) {
+					ux_warn("cannot create '%s'\n",
+						paths[n]);
+					continue;
+				}
+
+				rem = sizes[n];
+				while (rem > 0) {
+					uint32_t chunk = rem >
+							 EFS_MAX_WRITE_REQ ?
+							 EFS_MAX_WRITE_REQ :
+							 rem;
+					int w = efs_write(sess, fdata, off,
+							  datas[n] + off,
+							  chunk);
+					if (w < 0)
+						break;
+					off += w;
+					rem -= w;
+				}
+				efs_close(sess, fdata);
+				efs_written++;
+				ux_debug("restored %s (%zu bytes)\n",
+					 paths[n], sizes[n]);
+			}
+
+			for (n = 0; n < entry_count; n++) {
+				free(paths[n]);
+				free(datas[n]);
+			}
+			free(paths);
+			free(datas);
+			free(sizes);
+		}
+
+		xmlFree(name);
+	}
+
+	xmlFreeDoc(doc);
+
+	ux_info("XQCN restore complete: %d NV items, %d EFS files\n",
+		nv_written, efs_written);
+	return 0;
+}
+
+/*
+ * Offline XQCN -> TAR conversion.
+ */
+int diag_xqcn_to_tar(const char *xqcn_file, const char *tar_file)
+{
+	xmlDocPtr doc;
+	xmlNodePtr root, sub0, def_node, section, child, stream;
+	int fd;
+	int file_count = 0;
+
+	doc = xmlParseFile(xqcn_file);
+	if (!doc) {
+		ux_err("cannot parse XQCN file: %s\n", xqcn_file);
+		return -1;
+	}
+
+	root = xmlDocGetRootElement(doc);
+	sub0 = NULL;
+	for (xmlNodePtr c = root->children; c; c = c->next) {
+		if (c->type == XML_ELEMENT_NODE &&
+		    !strcmp((char *)c->name, "Storage")) {
+			sub0 = c;
+			break;
+		}
+	}
+	if (!sub0) {
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	def_node = NULL;
+	for (xmlNodePtr c = sub0->children; c; c = c->next) {
+		if (c->type == XML_ELEMENT_NODE &&
+		    !strcmp((char *)c->name, "Storage")) {
+			def_node = c;
+			break;
+		}
+	}
+	if (!def_node) {
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	fd = open(tar_file, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+	if (fd < 0) {
+		ux_err("cannot create %s: %s\n", tar_file, strerror(errno));
+		xmlFreeDoc(doc);
+		return -1;
+	}
+
+	/* Process NV_NUMBERED_ITEMS -> synthetic tar entries */
+	for (section = def_node->children; section; section = section->next) {
+		xmlChar *name;
+
+		if (section->type != XML_ELEMENT_NODE)
+			continue;
+		name = xmlGetProp(section, (const xmlChar *)"Name");
+		if (!name)
+			continue;
+
+		if (!strcmp((char *)name, "NV_NUMBERED_ITEMS") &&
+		    !strcmp((char *)section->name, "Storage")) {
+			for (stream = section->children; stream;
+			     stream = stream->next) {
+				xmlChar *sname, *val;
+				uint8_t *data;
+				size_t data_len;
+				size_t off;
+
+				if (stream->type != XML_ELEMENT_NODE)
+					continue;
+				sname = xmlGetProp(stream,
+						   (const xmlChar *)"Name");
+				if (!sname)
+					continue;
+				if (strcmp((char *)sname,
+					   "NV_ITEM_ARRAY") != 0) {
+					xmlFree(sname);
+					continue;
+				}
+				xmlFree(sname);
+
+				val = xmlGetProp(stream,
+						 (const xmlChar *)"Value");
+				if (!val)
+					continue;
+
+				data = xqcn_parse_hex((char *)val, &data_len);
+				xmlFree(val);
+				if (!data)
+					continue;
+
+				/* Write NV items as nv_items/NNNNN.bin */
+				for (off = 0;
+				     off + XQCN_NV_RECORD_SIZE <= data_len;
+				     off += XQCN_NV_RECORD_SIZE) {
+					uint32_t nv_id;
+					char nv_path[64];
+
+					memcpy(&nv_id, &data[off + 4], 4);
+					snprintf(nv_path, sizeof(nv_path),
+						 "nv_items/%05u.bin", nv_id);
+					tar_write_header(fd, nv_path, 0100644,
+							 NV_ITEM_DATA_SIZE,
+							 0, '0', NULL);
+					if (write(fd, &data[off + 8],
+						  NV_ITEM_DATA_SIZE) !=
+					    NV_ITEM_DATA_SIZE)
+						ux_warn("NV data write failed\n");
+					/* Pad to 512-byte boundary */
+					{
+						uint8_t pad[512] = {0};
+						int padsz = 512 -
+							    (NV_ITEM_DATA_SIZE
+							     % 512);
+
+						if (write(fd, pad, padsz) !=
+						    padsz)
+							ux_warn("NV pad write failed\n");
+					}
+					file_count++;
+				}
+				free(data);
+			}
+		}
+
+		/* EFS sections -> TAR entries */
+		if ((!strcmp((char *)name, "EFS_Backup") ||
+		     !strcmp((char *)name, "Provisioning_Item_Files") ||
+		     !strcmp((char *)name, "NV_Items")) &&
+		    !strcmp((char *)section->name, "Storage")) {
+			xmlNodePtr dir_node = NULL, data_node = NULL;
+			bool is_backup = !strcmp((char *)name, "EFS_Backup");
+			int entry_count = 0;
+
+			for (child = section->children; child;
+			     child = child->next) {
+				xmlChar *cname;
+
+				if (child->type != XML_ELEMENT_NODE)
+					continue;
+				cname = xmlGetProp(child,
+						   (const xmlChar *)"Name");
+				if (!cname)
+					continue;
+				if (!strcmp((char *)cname, "EFS_Dir"))
+					dir_node = child;
+				else if (!strcmp((char *)cname, "EFS_Data"))
+					data_node = child;
+				xmlFree(cname);
+			}
+
+			if (!dir_node || !data_node) {
+				xmlFree(name);
+				continue;
+			}
+
+			for (stream = dir_node->children; stream;
+			     stream = stream->next) {
+				if (stream->type == XML_ELEMENT_NODE)
+					entry_count++;
+			}
+
+			/* Read paths and data in parallel */
+			{
+				xmlNodePtr dir_s = dir_node->children;
+				xmlNodePtr data_s = data_node->children;
+				int idx;
+
+				for (idx = 0; idx < entry_count; idx++) {
+					xmlChar *dval, *pval;
+					uint8_t *praw, *ddata;
+					size_t praw_len, ddata_len;
+					const char *pstart;
+					size_t plen;
+					char efs_path[512];
+					const char *tar_path;
+
+					while (dir_s &&
+					       dir_s->type != XML_ELEMENT_NODE)
+						dir_s = dir_s->next;
+					while (data_s &&
+					       data_s->type != XML_ELEMENT_NODE)
+						data_s = data_s->next;
+					if (!dir_s || !data_s)
+						break;
+
+					pval = xmlGetProp(dir_s,
+						(const xmlChar *)"Value");
+					dval = xmlGetProp(data_s,
+						(const xmlChar *)"Value");
+					dir_s = dir_s->next;
+					data_s = data_s->next;
+
+					if (!pval || !dval) {
+						if (pval) xmlFree(pval);
+						if (dval) xmlFree(dval);
+						continue;
+					}
+
+					praw = xqcn_parse_hex((char *)pval,
+							      &praw_len);
+					ddata = xqcn_parse_hex((char *)dval,
+							       &ddata_len);
+					xmlFree(pval);
+					xmlFree(dval);
+
+					if (!praw || !ddata) {
+						free(praw);
+						free(ddata);
+						continue;
+					}
+
+					if (is_backup && praw_len > 8) {
+						pstart = (char *)praw + 8;
+						plen = strnlen(pstart,
+							       praw_len - 8);
+					} else {
+						pstart = (char *)praw;
+						plen = strnlen(pstart,
+							       praw_len);
+					}
+
+					snprintf(efs_path, sizeof(efs_path),
+						 "%.*s", (int)plen, pstart);
+
+					tar_path = efs_path[0] == '/' ?
+						   efs_path + 1 : efs_path;
+
+					tar_write_header(fd, tar_path,
+							 0100644,
+							 (int32_t)ddata_len,
+							 0, '0', NULL);
+					if (ddata_len > 0 &&
+					    write(fd, ddata, ddata_len) !=
+					    (ssize_t)ddata_len)
+						ux_warn("EFS data write failed\n");
+					if (ddata_len % 512) {
+						uint8_t pad[512] = {0};
+						int padsz = 512 -
+							    (ddata_len % 512);
+
+						if (write(fd, pad, padsz) !=
+						    padsz)
+							ux_warn("TAR pad write failed\n");
+					}
+
+					free(praw);
+					free(ddata);
+					file_count++;
+				}
+			}
+		}
+
+		xmlFree(name);
+	}
+
+	/* TAR end */
+	{
+		uint8_t zeros[1024] = {0};
+
+		if (write(fd, zeros, 1024) != 1024)
+			ux_warn("TAR end write failed\n");
+	}
+
+	close(fd);
+	xmlFreeDoc(doc);
+
+	ux_info("xqcn2tar: wrote %d entries to %s\n", file_count, tar_file);
+	return 0;
+}
+
+/*
+ * Offline TAR -> XQCN conversion.
+ */
+int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file)
+{
+	uint8_t header[512];
+	int fd;
+	FILE *fp;
+	int file_count = 0;
+	int nv_count = 0;
+	int i;
+
+	/* Collect files from TAR into arrays */
+	struct {
+		char path[512];
+		uint8_t *data;
+		size_t size;
+	} *backup_files = NULL, *prov_files = NULL, *nvitems_files = NULL;
+	int backup_count = 0, backup_cap = 0;
+	int prov_count = 0, prov_cap = 0;
+	int nvitems_count = 0, nvitems_cap = 0;
+
+	/* NV items from synthetic nv_items/ paths */
+	struct {
+		uint32_t nv_id;
+		uint8_t data[NV_ITEM_DATA_SIZE];
+	} *nv_items = NULL;
+	int nv_cap = 0;
+
+	fd = open(tar_file, O_RDONLY | O_BINARY);
+	if (fd < 0) {
+		ux_err("cannot open %s: %s\n", tar_file, strerror(errno));
+		return -1;
+	}
+
+	while (read(fd, header, 512) == 512) {
+		bool all_zero = true;
+		char name[101];
+		unsigned long size;
+		unsigned long blocks;
+		uint8_t *data;
+		char efs_path[512];
+		int i;
+
+		for (i = 0; i < 512; i++) {
+			if (header[i] != 0) {
+				all_zero = false;
+				break;
+			}
+		}
+		if (all_zero)
+			break;
+
+		if (!tar_checksum_valid(header))
+			break;
+
+		memset(name, 0, sizeof(name));
+		memcpy(name, header, 100);
+		size = tar_parse_octal((char *)header + 124, 12);
+
+		if (header[156] != '0' && header[156] != '\0') {
+			blocks = (size + 511) / 512;
+			if (blocks > 0)
+				lseek(fd, blocks * 512, SEEK_CUR);
+			continue;
+		}
+
+		data = NULL;
+		if (size > 0) {
+			data = malloc(size);
+			if (!data)
+				break;
+			if (read(fd, data, size) != (ssize_t)size) {
+				free(data);
+				break;
+			}
+			blocks = (size + 511) / 512;
+			if (blocks * 512 > size)
+				lseek(fd, blocks * 512 - size, SEEK_CUR);
+		}
+
+		/* Ensure leading / for EFS path */
+		if (name[0] == '/')
+			snprintf(efs_path, sizeof(efs_path), "%s", name);
+		else
+			snprintf(efs_path, sizeof(efs_path), "/%s", name);
+
+		/* Check for synthetic NV item paths */
+		if (strncmp(name, "nv_items/", 9) == 0) {
+			uint32_t nv_id;
+
+			if (sscanf(name + 9, "%u", &nv_id) == 1 &&
+			    data && size >= NV_ITEM_DATA_SIZE) {
+				if (nv_count >= nv_cap) {
+					nv_cap = nv_cap ? nv_cap * 2 : 256;
+					nv_items = realloc(nv_items,
+						nv_cap * sizeof(*nv_items));
+				}
+				nv_items[nv_count].nv_id = nv_id;
+				memcpy(nv_items[nv_count].data, data,
+				       NV_ITEM_DATA_SIZE);
+				nv_count++;
+			}
+			free(data);
+			continue;
+		}
+
+		/* Classify into backup / provisioning / nv_items */
+		switch (efs_path_xqcn_section(efs_path)) {
+		case XQCN_SECTION_BACKUP:
+			if (backup_count >= backup_cap) {
+				backup_cap = backup_cap ?
+					     backup_cap * 2 : 64;
+				backup_files = realloc(backup_files,
+					backup_cap *
+					sizeof(*backup_files));
+			}
+			snprintf(backup_files[backup_count].path,
+				 sizeof(backup_files[backup_count].path),
+				 "%s", efs_path);
+			backup_files[backup_count].data = data;
+			backup_files[backup_count].size = size;
+			backup_count++;
+			break;
+		case XQCN_SECTION_NVITEMS:
+			if (nvitems_count >= nvitems_cap) {
+				nvitems_cap = nvitems_cap ?
+					      nvitems_cap * 2 : 16;
+				nvitems_files = realloc(nvitems_files,
+					nvitems_cap *
+					sizeof(*nvitems_files));
+			}
+			snprintf(nvitems_files[nvitems_count].path,
+				 sizeof(nvitems_files[nvitems_count].path),
+				 "%s", efs_path);
+			nvitems_files[nvitems_count].data = data;
+			nvitems_files[nvitems_count].size = size;
+			nvitems_count++;
+			break;
+		default:
+			if (prov_count >= prov_cap) {
+				prov_cap = prov_cap ? prov_cap * 2 : 256;
+				prov_files = realloc(prov_files,
+					prov_cap * sizeof(*prov_files));
+			}
+			snprintf(prov_files[prov_count].path,
+				 sizeof(prov_files[prov_count].path),
+				 "%s", efs_path);
+			prov_files[prov_count].data = data;
+			prov_files[prov_count].size = size;
+			prov_count++;
+			break;
+		}
+		file_count++;
+	}
+
+	close(fd);
+
+	/* Write XQCN */
+	fp = fopen(xqcn_file, "w");
+	if (!fp) {
+		ux_err("cannot create %s: %s\n", xqcn_file,
+		       strerror(errno));
+		goto out_free;
+	}
+
+	fprintf(fp, "<?xml version=\"1.0\" encoding=\"Windows-1252\" ?>\n");
+	fprintf(fp, "<Storage Name='%s'>\n",
+		strrchr(xqcn_file, '/') ?
+		strrchr(xqcn_file, '/') + 1 : xqcn_file);
+	fprintf(fp, "  <Storage Name='00000000'>\n");
+	fprintf(fp, "    <Storage Name='default'>\n");
+
+	/* NV_NUMBERED_ITEMS */
+	fprintf(fp, "      <Storage Name='NV_NUMBERED_ITEMS'>\n");
+	{
+		size_t arr_len = nv_count * XQCN_NV_RECORD_SIZE;
+
+		fprintf(fp, "        <Stream Length='%zu'"
+			" Name='NV_ITEM_ARRAY' Value='", arr_len);
+		for (i = 0; i < nv_count; i++) {
+			uint8_t rec[XQCN_NV_RECORD_SIZE];
+			uint16_t rsize = XQCN_NV_RECORD_SIZE;
+			uint16_t sub = 0x0001;
+
+			memset(rec, 0, sizeof(rec));
+			memcpy(&rec[0], &rsize, 2);
+			memcpy(&rec[2], &sub, 2);
+			memcpy(&rec[4], &nv_items[i].nv_id, 4);
+			memcpy(&rec[8], nv_items[i].data, NV_ITEM_DATA_SIZE);
+
+			if (i > 0)
+				fprintf(fp, " ");
+			xqcn_write_hex(fp, rec, XQCN_NV_RECORD_SIZE);
+		}
+		fprintf(fp, "'/>\n");
+	}
+	fprintf(fp, "        <Stream Length='0'"
+		" Name='NV_ITEM_ARRAY_SIM_1' Value=''/>\n");
+	fprintf(fp, "        <Stream Length='0'"
+		" Name='NV_ITEM_ARRAY_SIM_2' Value=''/>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/*
+	 * EFS_Backup — includes backup files (rfnv) + nv_items files
+	 * (rfc) with 8-byte headers, matching QPST's duplication.
+	 */
+	fprintf(fp, "      <Storage Name='EFS_Backup'>\n");
+	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+	for (i = 0; i < backup_count; i++)
+		xqcn_write_backup_dir_entry(fp, i,
+					    backup_files[i].path, 0100644);
+	for (i = 0; i < nvitems_count; i++)
+		xqcn_write_backup_dir_entry(fp, backup_count + i,
+					    nvitems_files[i].path, 0);
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+	for (i = 0; i < backup_count; i++)
+		xqcn_write_data_entry(fp, i, backup_files[i].data,
+				      backup_files[i].size);
+	for (i = 0; i < nvitems_count; i++)
+		xqcn_write_data_entry(fp, backup_count + i,
+				      nvitems_files[i].data,
+				      nvitems_files[i].size);
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/* Provisioning_Item_Files */
+	fprintf(fp, "      <Storage Name='Provisioning_Item_Files'>\n");
+	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+	for (i = 0; i < prov_count; i++)
+		xqcn_write_prov_dir_entry(fp, i, prov_files[i].path);
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+	for (i = 0; i < prov_count; i++)
+		xqcn_write_data_entry(fp, i, prov_files[i].data,
+				      prov_files[i].size);
+	fprintf(fp, "        </Storage>\n");
+	fprintf(fp, "      </Storage>\n");
+
+	/* NV_Items (RFC/calibration data) */
+	if (nvitems_count > 0) {
+		fprintf(fp, "      <Storage Name='NV_Items'>\n");
+		fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
+		for (i = 0; i < nvitems_count; i++)
+			xqcn_write_prov_dir_entry(fp, i,
+						  nvitems_files[i].path);
+		fprintf(fp, "        </Storage>\n");
+		fprintf(fp, "        <Storage Name='EFS_Data'>\n");
+		for (i = 0; i < nvitems_count; i++)
+			xqcn_write_data_entry(fp, i,
+					      nvitems_files[i].data,
+					      nvitems_files[i].size);
+		fprintf(fp, "        </Storage>\n");
+		fprintf(fp, "      </Storage>\n");
+	}
+
+	/* Minimal metadata */
+	{
+		uint8_t mpi[16] = {0};
+		uint32_t magic = XQCN_MPI_MAGIC;
+		uint16_t zero = 0;
+
+		memcpy(&mpi[0], &magic, 4);
+		memcpy(&mpi[8], &zero, 2);
+		memcpy(&mpi[10], &zero, 2);
+		fprintf(fp, "      <Stream Length='12'"
+			" Name='Mobile_Property_Info' Value='");
+		xqcn_write_hex(fp, mpi, 12);
+		fprintf(fp, "'/>\n");
+	}
+
+	fprintf(fp, "    </Storage>\n");
+	fprintf(fp, "  </Storage>\n");
+
+	/* File_Version */
+	{
+		uint8_t fv[6] = {0};
+		uint32_t version = XQCN_FILE_VERSION;
+
+		memcpy(fv, &version, 4);
+		fprintf(fp, "  <Stream Length='6'"
+			" Name='File_Version' Value='");
+		xqcn_write_hex(fp, fv, 6);
+		fprintf(fp, "'/>\n");
+	}
+
+	fprintf(fp, "</Storage>\n");
+	fclose(fp);
+
+	ux_info("tar2xqcn: %d NV items, %d backup, %d provisioning,"
+		" %d nv_items files -> %s\n",
+		nv_count, backup_count, prov_count, nvitems_count,
+		xqcn_file);
+
+out_free:
+	for (i = 0; i < backup_count; i++)
+		free(backup_files[i].data);
+	for (i = 0; i < prov_count; i++)
+		free(prov_files[i].data);
+	for (i = 0; i < nvitems_count; i++)
+		free(nvitems_files[i].data);
+	free(backup_files);
+	free(prov_files);
+	free(nvitems_files);
+	free(nv_items);
+	return fp ? 0 : -1;
 }

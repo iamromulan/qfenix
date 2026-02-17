@@ -9,4 +9,5 @@ version.h
 scripts
 .checkpatch-camelcase.git.
 .scripts/
+.claude/
 CLAUDE.md
