@@ -180,6 +180,9 @@ static int diag_port_open(const char *port)
 		return -1;
 	}
 
+	/* Flush any stale data in the serial port buffers */
+	tcflush(fd, TCIOFLUSH);
+
 	return fd;
 }
 
@@ -663,7 +666,8 @@ int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
 	uint8_t frame[8192];
 	uint8_t raw[8192];
 	int frame_len;
-	int n;
+	int retries;
+	int n, decoded;
 
 	frame_len = hdlc_encode(cmd, cmd_len, frame, sizeof(frame));
 	if (frame_len < 0) {
@@ -677,13 +681,43 @@ int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
 		return -1;
 	}
 
-	n = diag_port_read_frame(sess->fd, raw, sizeof(raw), 3000);
-	if (n <= 0) {
-		ux_err("DIAG read failed\n");
-		return -1;
+	/*
+	 * Read responses, skipping any unsolicited DIAG messages
+	 * (log packets, event reports, subsystem dispatches) that
+	 * don't match the command we sent. Retry up to 10 times.
+	 */
+	for (retries = 0; retries < 10; retries++) {
+		n = diag_port_read_frame(sess->fd, raw, sizeof(raw), 3000);
+		if (n <= 0) {
+			ux_err("DIAG read failed\n");
+			return -1;
+		}
+
+		decoded = hdlc_decode(raw, n, resp, resp_size);
+		if (decoded <= 0)
+			return decoded;
+
+		/* Check if response command matches what we sent */
+		if (resp[0] == cmd[0])
+			return decoded;
+
+		/*
+		 * Accept DIAG error responses as valid replies:
+		 * 0x13 = BAD_CMD_F, 0x14 = BAD_PARM_F,
+		 * 0x15 = BAD_LEN_F, 0x16 = BAD_DEV_F,
+		 * 0x17 = BAD_MODE_F, 0x18 = BAD_SPC_MODE_F
+		 */
+		if (resp[0] >= 0x13 && resp[0] <= 0x18)
+			return decoded;
+
+		ux_debug("DIAG: skipping unsolicited response "
+			 "(got cmd=0x%02x, expected 0x%02x)\n",
+			 resp[0], cmd[0]);
 	}
 
-	return hdlc_decode(raw, n, resp, resp_size);
+	ux_err("DIAG: no matching response after %d retries "
+	       "(expected cmd=0x%02x)\n", retries, cmd[0]);
+	return -1;
 }
 
 const char *diag_nv_status_str(uint16_t status)
@@ -732,6 +766,32 @@ int diag_nv_read(struct diag_session *sess, uint16_t item,
 	return 0;
 }
 
+/*
+ * NV items excluded from backup — these cause "Bad Response" in QPST
+ * when written back to the modem. NV item numbers are standardized
+ * across Qualcomm chipsets but not all modems handle writes for every ID.
+ */
+static const uint16_t nv_excluded_ids[] = {
+	3252,	/* causes protocol error on RM551E-GL (SDX75) */
+};
+
+static bool nv_item_excluded(uint16_t item)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(nv_excluded_ids) / sizeof(nv_excluded_ids[0]); i++) {
+		if (nv_excluded_ids[i] == item)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Write NV item. Returns:
+ *   0 (NV_DONE_S)   = success
+ *   > 0              = NV status code (READONLY, BADPARM, etc.)
+ *   -1               = protocol error (bad/no response)
+ */
 int diag_nv_write(struct diag_session *sess, uint16_t item,
 		  const uint8_t *data, size_t data_len)
 {
@@ -754,17 +814,17 @@ int diag_nv_write(struct diag_session *sess, uint16_t item,
 		return -1;
 
 	if (n < NV_ITEM_PKT_SIZE || resp[0] != DIAG_NV_WRITE_F) {
-		ux_err("NV write error: unexpected response (cmd=0x%02x, len=%d)\n",
-		       resp[0], n);
+		ux_debug("NV write: bad response (cmd=0x%02x, len=%d)\n",
+			 resp[0], n);
 		return -1;
 	}
 
 	status = resp[3 + NV_ITEM_DATA_SIZE] |
 		 (resp[4 + NV_ITEM_DATA_SIZE] << 8);
 	if (status != NV_DONE_S) {
-		ux_err("NV write failed: %s (status=%u)\n",
-		       diag_nv_status_str(status), status);
-		return -1;
+		ux_debug("NV write %d: %s (status=%u)\n",
+			 item, diag_nv_status_str(status), status);
+		return (int)status;
 	}
 
 	return 0;
@@ -1411,6 +1471,34 @@ static int efs_mkdir_op(struct diag_session *sess, const char *path,
 	return 0;
 }
 
+/*
+ * Create all parent directories for a path on EFS (mkdir -p).
+ * e.g. for "/nv/item_files/rfnv/00021722" creates:
+ *   /nv, /nv/item_files, /nv/item_files/rfnv
+ */
+static int efs_mkdirp(struct diag_session *sess, const char *filepath)
+{
+	char buf[256];
+	size_t len = strlen(filepath);
+	char *p;
+
+	if (len >= sizeof(buf))
+		return -1;
+
+	memcpy(buf, filepath, len + 1);
+
+	/* Walk path components, creating each directory */
+	for (p = buf + 1; *p; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			efs_mkdir_op(sess, buf, 0x1FF);
+			*p = '/';
+		}
+	}
+
+	return 0;
+}
+
 static int efs_symlink_op(struct diag_session *sess, const char *target,
 			  const char *linkpath)
 {
@@ -1515,8 +1603,9 @@ static int efs_readlink(struct diag_session *sess, const char *path,
  * QPST uses these to access /nv/item_files/ and other restricted paths.
  */
 
-static int efs_get_item(struct diag_session *sess, const char *path,
-			uint8_t *buf, size_t buf_size, int32_t *data_len_out)
+static int efs_get_item_op(struct diag_session *sess, uint8_t opcode,
+			   const char *path, uint8_t *buf, size_t buf_size,
+			   int32_t *data_len_out)
 {
 	uint8_t cmd[4 + 256];
 	uint8_t resp[8192];
@@ -1530,7 +1619,7 @@ static int efs_get_item(struct diag_session *sess, const char *path,
 		return -1;
 
 	memset(cmd, 0, sizeof(cmd));
-	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_GET);
+	efs_cmd_header(cmd, sess->efs_method, opcode);
 	memcpy(&cmd[4], path, path_len);
 
 	n = diag_send(sess, cmd, 4 + path_len, resp, sizeof(resp));
@@ -1558,6 +1647,25 @@ static int efs_get_item(struct diag_session *sess, const char *path,
 	return 0;
 }
 
+static int efs_get_item(struct diag_session *sess, const char *path,
+			uint8_t *buf, size_t buf_size, int32_t *data_len_out)
+{
+	/* Try current opcode 39, fall back to deprecated opcode 27 */
+	int ret = efs_get_item_op(sess, EFS2_DIAG_GET, path,
+				  buf, buf_size, data_len_out);
+
+	if (ret == 0)
+		return 0;
+
+	return efs_get_item_op(sess, EFS2_DIAG_GET_V1, path,
+			       buf, buf_size, data_len_out);
+}
+
+/*
+ * PUT v2 (opcode 38) — atomic item file write.
+ * Format: [header 4][data_len uint16][pad 2][flags int32][mode int32][data][path\0]
+ * This is the current version; opcode 26 is deprecated.
+ */
 static int efs_put_item(struct diag_session *sess, const char *path,
 			const uint8_t *data, int32_t data_len,
 			int32_t flags, int32_t mode)
@@ -1565,6 +1673,7 @@ static int efs_put_item(struct diag_session *sess, const char *path,
 	uint8_t cmd[4096];
 	uint8_t resp[64];
 	size_t path_len;
+	uint16_t dlen;
 	int32_t diag_errno;
 	int n;
 
@@ -1572,8 +1681,28 @@ static int efs_put_item(struct diag_session *sess, const char *path,
 	if ((size_t)data_len + path_len > sizeof(cmd) - 16)
 		return -1;
 
+	dlen = (uint16_t)data_len;
+
 	memset(cmd, 0, 16);
 	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_PUT);
+	memcpy(&cmd[4], &dlen, 2);
+	/* cmd[6-7] = 0 padding */
+	memcpy(&cmd[8], &flags, 4);
+	memcpy(&cmd[12], &mode, 4);
+	memcpy(&cmd[16], data, data_len);
+	memcpy(&cmd[16 + data_len], path, path_len);
+
+	n = diag_send(sess, cmd, 16 + data_len + path_len, resp, sizeof(resp));
+	if (n >= 8) {
+		memcpy(&diag_errno, &resp[4], 4);
+		if (diag_errno == 0)
+			return 0;
+		ux_debug("PUT v2 '%s' errno=%d\n", path, diag_errno);
+	}
+
+	/* Fall back to deprecated opcode 26 (32-bit data_len) */
+	memset(cmd, 0, 16);
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_PUT_V1);
 	memcpy(&cmd[4], &data_len, 4);
 	memcpy(&cmd[8], &flags, 4);
 	memcpy(&cmd[12], &mode, 4);
@@ -1588,6 +1717,61 @@ static int efs_put_item(struct diag_session *sess, const char *path,
 	if (diag_errno != 0)
 		return -1;
 
+	return 0;
+}
+
+/* Check if an EFS path is an item file (not a regular file) */
+static bool is_item_path(const char *path)
+{
+	return (strncmp(path, "/nv/item_files/", 15) == 0 ||
+		strncmp(path, "/nv/reg_files/", 14) == 0);
+}
+
+/*
+ * Write an item file to EFS using PUT (atomic), with fallback
+ * to open/write/close with O_ITEMFILE.
+ */
+static int efs_write_item(struct diag_session *sess, const char *path,
+			  const uint8_t *data, size_t data_len, int32_t mode)
+{
+	int32_t flags;
+	int32_t fdata;
+
+	/* Try PUT with O_ITEMFILE|O_AUTODIR first (atomic, preferred) */
+	flags = EFS_O_CREAT | EFS_O_WRONLY | EFS_O_TRUNC |
+		EFS_O_ITEMFILE | EFS_O_AUTODIR;
+	if (efs_put_item(sess, path, data, (int32_t)data_len,
+			 flags, mode) == 0)
+		return 0;
+
+	/* Fallback: open with O_ITEMFILE + O_AUTODIR, write, close */
+	efs_mkdirp(sess, path);
+	flags = 0x301 | EFS_O_ITEMFILE | EFS_O_AUTODIR;
+	fdata = efs_open(sess, path, flags, mode);
+	if (fdata < 0) {
+		/* Last try: open without O_ITEMFILE */
+		flags = 0x301 | EFS_O_AUTODIR;
+		fdata = efs_open(sess, path, flags, mode);
+		if (fdata < 0)
+			return -1;
+	}
+
+	uint32_t offset = 0;
+	size_t remaining = data_len;
+
+	while (remaining > 0) {
+		uint32_t chunk = remaining > EFS_MAX_WRITE_REQ ?
+				 EFS_MAX_WRITE_REQ : remaining;
+		int w = efs_write(sess, fdata, offset, data + offset, chunk);
+
+		if (w < 0) {
+			efs_close(sess, fdata);
+			return -1;
+		}
+		offset += w;
+		remaining -= w;
+	}
+	efs_close(sess, fdata);
 	return 0;
 }
 
@@ -2150,16 +2334,50 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 		case '0': /* Regular file */
 		case '\0': /* Regular file (old TAR) */
 		{
-			/* EFS oflag: O_CREAT|O_WRONLY|O_TRUNC = 0x301 */
-			int32_t fdata = efs_open(sess, efs_path, 0x301,
-						 (int32_t)mode);
+			bool item = ((mode & 0170000) == EFS_S_IFITM) ||
+				    is_item_path(efs_path);
+			int16_t perm = (int16_t)(mode & 0x1FF);
+			unsigned long tar_blocks = (size + 511) / 512;
+
+			/* Item files: buffer and use PUT */
+			if (item && size <= 2048) {
+				uint8_t ibuf[2048];
+				ssize_t r = read(fd, ibuf, size);
+
+				if (r < 0 || (unsigned long)r < size) {
+					ux_err("read from TAR failed\n");
+					ret = -1;
+					break;
+				}
+
+				if (efs_write_item(sess, efs_path,
+						   ibuf, size, perm) == 0) {
+					files_restored++;
+					ux_debug("restored %s (%lu bytes)\n",
+						 efs_path, size);
+				} else {
+					ux_warn("failed to create '%s'\n",
+						efs_path);
+				}
+
+				/* Skip to next TAR boundary */
+				long pad = (long)(tar_blocks * 512 - size);
+
+				if (pad > 0)
+					lseek(fd, pad, SEEK_CUR);
+				break;
+			}
+
+			/* Regular files: open/write/close */
+			efs_mkdirp(sess, efs_path);
+
+			int32_t fdata = efs_open(sess, efs_path,
+						 0x301 | EFS_O_AUTODIR,
+						 (int32_t)perm);
 			if (fdata < 0) {
 				ux_warn("failed to create file '%s'\n",
 					efs_path);
-				/* Skip data blocks */
-				unsigned long blocks = (size + 511) / 512;
-
-				lseek(fd, blocks * 512, SEEK_CUR);
+				lseek(fd, tar_blocks * 512, SEEK_CUR);
 				break;
 			}
 
@@ -2189,17 +2407,14 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 				offset += w;
 				remaining -= w;
 
-				/* If short write, adjust file position */
 				if ((uint32_t)w < (uint32_t)r)
 					lseek(fd, (off_t)w - r, SEEK_CUR);
 			}
 
 			efs_close(sess, fdata);
-			efs_chmod_op(sess, efs_path, (int16_t)mode);
+			efs_chmod_op(sess, efs_path, perm);
 
-			/* Skip to next 512-byte TAR boundary */
 			{
-				unsigned long tar_blocks = (size + 511) / 512;
 				unsigned long consumed = size - remaining;
 				long to_skip = (long)(tar_blocks * 512 -
 						      consumed);
@@ -2403,8 +2618,27 @@ int diag_efs_put(struct diag_session *sess, const char *local_path,
 		return -1;
 	}
 
-	/* EFS oflag: O_CREAT|O_WRONLY|O_TRUNC = 0x301 */
-	fdata = efs_open(sess, efs_path, 0x301, 0644);
+	/*
+	 * For item files, use PUT with O_ITEMFILE.
+	 * For regular files, use open/write/close with O_AUTODIR.
+	 */
+	if (is_item_path(efs_path) && sb.st_size <= 2048) {
+		uint8_t ibuf[2048];
+		ssize_t r = read(local_fd, ibuf, sb.st_size);
+
+		close(local_fd);
+		if (r < 0 || r < sb.st_size) {
+			ux_err("read from '%s' failed\n", local_path);
+			return -1;
+		}
+		ux_info("writing '%s' to EFS '%s' (%ld bytes, item file)\n",
+			local_path, efs_path, (long)sb.st_size);
+		return efs_write_item(sess, efs_path, ibuf,
+				      (size_t)sb.st_size, 0644);
+	}
+
+	efs_mkdirp(sess, efs_path);
+	fdata = efs_open(sess, efs_path, 0x301 | EFS_O_AUTODIR, 0644);
 	if (fdata < 0) {
 		ux_err("cannot create EFS file '%s'\n", efs_path);
 		close(local_fd);
@@ -3064,8 +3298,14 @@ int diag_nv_scan(struct diag_session *sess,
 	/* Scan default subscription */
 	for (i = 0; i <= NV_SCAN_MAX_ID; i++) {
 		if (diag_nv_read(sess, (uint16_t)i, &item) == 0 &&
-		    item.status == NV_DONE_S)
-			nv_scan_add(def_items, &item);
+		    item.status == NV_DONE_S) {
+			if (nv_item_excluded((uint16_t)i)) {
+				ux_debug("NV %d: excluded (blocklist)\n", i);
+			} else {
+				nv_scan_add(def_items, &item);
+				ux_debug("NV %d: captured\n", i);
+			}
+		}
 
 		ux_progress("NV default", i, NV_SCAN_MAX_ID);
 	}
@@ -3075,8 +3315,14 @@ int diag_nv_scan(struct diag_session *sess,
 	/* Scan SIM_1 subscription (index 1) */
 	for (i = 0; i <= NV_SCAN_MAX_ID; i++) {
 		if (diag_nv_read_sub(sess, (uint16_t)i, 1, &item) == 0 &&
-		    item.status == NV_DONE_S)
-			nv_scan_add(sim1_items, &item);
+		    item.status == NV_DONE_S) {
+			if (nv_item_excluded((uint16_t)i)) {
+				ux_debug("NV %d: excluded (blocklist)\n", i);
+			} else {
+				nv_scan_add(sim1_items, &item);
+				ux_debug("NV %d: captured (SIM_1)\n", i);
+			}
+		}
 
 		ux_progress("NV SIM_1", i, NV_SCAN_MAX_ID);
 	}
@@ -3272,14 +3518,15 @@ static void xqcn_write_hex(FILE *fp, const uint8_t *data, size_t len)
 }
 
 /*
- * Build EFS_Backup dir entry: 8-byte header + null-terminated path.
+ * Build EFS_Backup dir entry: 8-byte header + path (no null terminator).
  * Header: 01 00 01 01 + 4 bytes (mode as uint32_t LE).
+ * QPST format: path is NOT null-terminated in EFS_Backup entries.
  */
 static void xqcn_write_backup_dir_entry(FILE *fp, int idx,
 					 const char *path, int32_t mode)
 {
 	uint8_t header[8] = {0x01, 0x00, 0x01, 0x01, 0, 0, 0, 0};
-	size_t path_len = strlen(path) + 1; /* include null */
+	size_t path_len = strlen(path);
 	size_t total = 8 + path_len;
 
 	memcpy(&header[4], &mode, 4);
@@ -3294,10 +3541,25 @@ static void xqcn_write_backup_dir_entry(FILE *fp, int idx,
 
 /*
  * Build Provisioning dir entry: raw null-terminated path.
+ * QPST format: provisioning paths ARE null-terminated.
  */
 static void xqcn_write_prov_dir_entry(FILE *fp, int idx, const char *path)
 {
 	size_t path_len = strlen(path) + 1;
+
+	fprintf(fp, "          <Stream Length='%zu' Name='%08X' Value='",
+		path_len, idx);
+	xqcn_write_hex(fp, (const uint8_t *)path, path_len);
+	fprintf(fp, "'/>\n");
+}
+
+/*
+ * Build NV_Items dir entry: raw path (no null terminator).
+ * QPST format: NV_Items paths are NOT null-terminated.
+ */
+static void xqcn_write_nvitems_dir_entry(FILE *fp, int idx, const char *path)
+{
+	size_t path_len = strlen(path);
 
 	fprintf(fp, "          <Stream Length='%zu' Name='%08X' Value='",
 		path_len, idx);
@@ -3476,9 +3738,12 @@ int diag_efs_backup_xqcn(struct diag_session *sess, const char *output_file)
 
 		if (sec == XQCN_SECTION_BACKUP ||
 		    sec == XQCN_SECTION_NVITEMS) {
+			/* QPST uses 0x12D53D80 for rfnv, 0 for rfc */
+			int32_t attrs = (sec == XQCN_SECTION_BACKUP) ?
+					0x12D53D80 : 0;
 			xqcn_write_backup_dir_entry(fp, idx,
 						    efs_data.files[i].path,
-						    efs_data.files[i].mode);
+						    attrs);
 			idx++;
 		}
 	}
@@ -3535,8 +3800,8 @@ int diag_efs_backup_xqcn(struct diag_session *sess, const char *output_file)
 	for (i = 0; i < efs_data.count; i++) {
 		if (efs_path_xqcn_section(efs_data.files[i].path) ==
 		    XQCN_SECTION_NVITEMS) {
-			xqcn_write_prov_dir_entry(fp, idx,
-						  efs_data.files[i].path);
+			xqcn_write_nvitems_dir_entry(fp, idx,
+						     efs_data.files[i].path);
 			idx++;
 		}
 	}
@@ -3679,7 +3944,8 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 {
 	xmlDocPtr doc;
 	xmlNodePtr root, sub0, def_node, section, child, stream;
-	int nv_written = 0, efs_written = 0;
+	int nv_written = 0, nv_skipped = 0;
+	int efs_written = 0, efs_skipped = 0;
 	int n;
 
 	if (!sess->efs_detected) {
@@ -3779,20 +4045,34 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 				if (!data)
 					continue;
 
+				ux_info("restoring %zu NV items...\n",
+					data_len / XQCN_NV_RECORD_SIZE);
+
 				for (off = 0;
 				     off + XQCN_NV_RECORD_SIZE <= data_len;
 				     off += XQCN_NV_RECORD_SIZE) {
 					uint32_t nv_id;
 					uint16_t item_id;
+					int wr;
 
 					memcpy(&nv_id, &data[off + 4], 4);
 					item_id = (uint16_t)nv_id;
-					if (diag_nv_write(sess, item_id,
-							  &data[off + 8],
-							  NV_ITEM_DATA_SIZE)
-					    == 0) {
+					wr = diag_nv_write(sess, item_id,
+							   &data[off + 8],
+							   NV_ITEM_DATA_SIZE);
+					if (wr == 0) {
 						nv_written++;
-						ux_debug("NV %d written\n",
+						ux_debug("NV %d: NV_DONE_S\n",
+							 item_id);
+					} else if (wr > 0) {
+						nv_skipped++;
+						ux_debug("NV %d: %s\n",
+							 item_id,
+							 diag_nv_status_str(
+							 (uint16_t)wr));
+					} else {
+						nv_skipped++;
+						ux_debug("NV %d: Bad Response\n",
 							 item_id);
 					}
 				}
@@ -3807,6 +4087,12 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 		    !strcmp((char *)section->name, "Storage")) {
 			xmlNodePtr dir_node = NULL, data_node = NULL;
 			bool is_backup = !strcmp((char *)name, "EFS_Backup");
+			bool is_item_section =
+				!strcmp((char *)name,
+					"Provisioning_Item_Files") ||
+				!strcmp((char *)name, "NV_Items");
+
+			ux_debug("processing section: %s\n", (char *)name);
 			int entry_count = 0;
 			char **paths = NULL;
 			uint8_t **datas = NULL;
@@ -3915,40 +4201,67 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 			}
 
 			/* Write files to EFS */
+			ux_debug("%s: %d entries to restore\n",
+				 (char *)name, entry_count);
+
 			for (n = 0; n < entry_count; n++) {
-				int32_t fdata;
-				uint32_t off = 0;
-				size_t rem;
+				bool item;
 
 				if (!paths[n] || !datas[n])
 					continue;
 
-				fdata = efs_open(sess, paths[n], 0x301,
-						 0x1FF);
-				if (fdata < 0) {
-					ux_warn("cannot create '%s'\n",
-						paths[n]);
-					continue;
-				}
+				item = is_item_section ||
+				       is_item_path(paths[n]);
 
-				rem = sizes[n];
-				while (rem > 0) {
-					uint32_t chunk = rem >
-							 EFS_MAX_WRITE_REQ ?
-							 EFS_MAX_WRITE_REQ :
-							 rem;
-					int w = efs_write(sess, fdata, off,
-							  datas[n] + off,
-							  chunk);
-					if (w < 0)
-						break;
-					off += w;
-					rem -= w;
+				ux_debug("%s file: %s, size %zu%s\n",
+					 (char *)name, paths[n], sizes[n],
+					 item ? " (item)" : "");
+
+				if (item) {
+					/* Item files: use PUT with O_ITEMFILE */
+					if (efs_write_item(sess, paths[n],
+							   datas[n], sizes[n],
+							   0x1FF) < 0) {
+						efs_skipped++;
+						ux_debug("  FAILED: write error\n");
+						continue;
+					}
+				} else {
+					/* Regular files: open/write/close */
+					int32_t fdata;
+					uint32_t off = 0;
+					size_t rem;
+
+					efs_mkdirp(sess, paths[n]);
+					fdata = efs_open(sess, paths[n],
+							 0x301 | EFS_O_AUTODIR,
+							 0x1FF);
+					if (fdata < 0) {
+						efs_skipped++;
+						ux_debug("  FAILED: cannot create\n");
+						continue;
+					}
+
+					rem = sizes[n];
+					while (rem > 0) {
+						uint32_t chunk = rem >
+							EFS_MAX_WRITE_REQ ?
+							EFS_MAX_WRITE_REQ :
+							rem;
+						int w = efs_write(sess,
+							fdata, off,
+							datas[n] + off,
+							chunk);
+
+						if (w < 0)
+							break;
+						off += w;
+						rem -= w;
+					}
+					efs_close(sess, fdata);
 				}
-				efs_close(sess, fdata);
 				efs_written++;
-				ux_debug("restored %s (%zu bytes)\n",
-					 paths[n], sizes[n]);
+				ux_debug("  OK\n");
 			}
 
 			for (n = 0; n < entry_count; n++) {
@@ -3965,8 +4278,14 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 
 	xmlFreeDoc(doc);
 
-	ux_info("XQCN restore complete: %d NV items, %d EFS files\n",
-		nv_written, efs_written);
+	ux_info("XQCN restore complete:\n");
+	ux_info("  NV items: %d written, %d skipped\n",
+		nv_written, nv_skipped);
+	ux_info("  EFS files: %d written, %d skipped\n",
+		efs_written, efs_skipped);
+	if (efs_skipped > 0)
+		ux_info("  (skipped files could not be created via "
+			"PUT or open — check debug log)\n");
 	return 0;
 }
 
@@ -4451,7 +4770,7 @@ int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file)
 	fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
 	for (i = 0; i < backup_count; i++)
 		xqcn_write_backup_dir_entry(fp, i,
-					    backup_files[i].path, 0100644);
+					    backup_files[i].path, 0x12D53D80);
 	for (i = 0; i < nvitems_count; i++)
 		xqcn_write_backup_dir_entry(fp, backup_count + i,
 					    nvitems_files[i].path, 0);
@@ -4485,8 +4804,8 @@ int diag_tar_to_xqcn(const char *tar_file, const char *xqcn_file)
 		fprintf(fp, "      <Storage Name='NV_Items'>\n");
 		fprintf(fp, "        <Storage Name='EFS_Dir'>\n");
 		for (i = 0; i < nvitems_count; i++)
-			xqcn_write_prov_dir_entry(fp, i,
-						  nvitems_files[i].path);
+			xqcn_write_nvitems_dir_entry(fp, i,
+						     nvitems_files[i].path);
 		fprintf(fp, "        </Storage>\n");
 		fprintf(fp, "        <Storage Name='EFS_Data'>\n");
 		for (i = 0; i < nvitems_count; i++)

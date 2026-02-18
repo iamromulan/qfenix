@@ -2574,9 +2574,14 @@ static int qdl_nvwrite(int argc, char **argv)
 
 	if (ret == 0)
 		printf("NV item %u written successfully\n", item_id);
+	else if (ret > 0)
+		fprintf(stderr, "NV item %u: %s\n", item_id,
+			diag_nv_status_str((uint16_t)ret));
+	else
+		fprintf(stderr, "NV item %u: protocol error\n", item_id);
 
 	diag_close(sess);
-	return !!ret;
+	return (ret != 0) ? 1 : 0;
 }
 
 static void efsls_print_entry(const struct efs_dirent *entry, void *ctx)

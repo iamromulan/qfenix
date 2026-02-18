@@ -143,7 +143,7 @@ jobs:
           NPROC=$(sysctl -n hw.ncpu)
 
           # zlib
-          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          curl -sL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz
           cd zlib-1.3.1
           ./configure --static --prefix="$PREFIX"
           make -j$NPROC && make install
@@ -229,7 +229,7 @@ jobs:
           NPROC=$(sysctl -n hw.ncpu)
 
           # zlib
-          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          curl -sL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz
           cd zlib-1.3.1
           ./configure --static --prefix="$PREFIX"
           make -j$NPROC && make install
@@ -472,7 +472,7 @@ jobs:
           mkdir -p "$PREFIX"
 
           # Build zlib
-          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar xz
+          curl -sL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar xz
           cd zlib-1.3.1
           CC=aarch64-w64-mingw32-gcc AR=aarch64-w64-mingw32-ar RANLIB=aarch64-w64-mingw32-ranlib \
             ./configure --static --prefix="$PREFIX"

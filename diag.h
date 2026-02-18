@@ -52,8 +52,23 @@
 #define EFS2_DIAG_CHMOD		18
 
 /* EFS item interface commands (bypass file-level ACLs) */
-#define EFS2_DIAG_PUT		26
-#define EFS2_DIAG_GET		27
+#define EFS2_DIAG_PUT_V1	26	/* deprecated */
+#define EFS2_DIAG_GET_V1	27	/* deprecated */
+#define EFS2_DIAG_PUT		38	/* current version */
+#define EFS2_DIAG_GET		39	/* current version */
+
+/*
+ * Qualcomm EFS2 open flags (ARM ABI values, not standard POSIX).
+ * Verified: efs_open(0x301) = O_WRONLY|O_CREAT|O_TRUNC works.
+ */
+#define EFS_O_WRONLY	0x0001
+#define EFS_O_CREAT	0x0100
+#define EFS_O_TRUNC	0x0200
+#define EFS_O_ITEMFILE	0x40000		/* create as EFS item file */
+#define EFS_O_AUTODIR	0x80000		/* auto-create parent directories */
+
+/* EFS S_IFMT value for item files (proprietary, entry_type 15) */
+#define EFS_S_IFITM	0160000
 
 /* EFS factory image commands */
 #define EFS2_DIAG_PREP_FACT_IMAGE	25
