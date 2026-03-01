@@ -5104,7 +5104,14 @@ int main(int argc, char **argv)
 		ret = qdl_flash(argc, argv);
 	}
 
-	if (!ret)
+	/* Show fenix art on success, but not for lightweight subcommands
+	 * (qcseriald, list, atcmd, atconsole, version/help) that don't
+	 * perform device flashing/DIAG operations */
+	if (!ret && argc >= 2 &&
+	    strcmp(argv[1], "qcseriald") != 0 &&
+	    strcmp(argv[1], "list") != 0 &&
+	    strcmp(argv[1], "atcmd") != 0 &&
+	    strcmp(argv[1], "atconsole") != 0)
 		print_fenix_art(stdout);
 
 	if (qdl_log_file) {
