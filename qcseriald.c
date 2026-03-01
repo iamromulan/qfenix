@@ -54,9 +54,33 @@
 #define PROBE_RDY_TIMEOUT 30
 #define PROBE_AT_TIMEOUT  3
 
-#define PID_FILE        "/var/run/qcseriald.pid"
-#define STATUS_FILE     "/var/run/qcseriald.status"
-#define LOG_FILE        "/var/log/qcseriald.log"
+/*
+ * Runtime file paths — /var/run and /var/log require root.
+ * When auto-started by qfenix (non-root), use /tmp/ instead.
+ * Paths are resolved at startup by init_runtime_paths().
+ */
+static char g_pid_file[256];
+static char g_status_file[256];
+static char g_log_file[256];
+
+static void init_runtime_paths(void)
+{
+	if (getuid() == 0) {
+		snprintf(g_pid_file, sizeof(g_pid_file),
+			 "/var/run/qcseriald.pid");
+		snprintf(g_status_file, sizeof(g_status_file),
+			 "/var/run/qcseriald.status");
+		snprintf(g_log_file, sizeof(g_log_file),
+			 "/var/log/qcseriald.log");
+	} else {
+		snprintf(g_pid_file, sizeof(g_pid_file),
+			 "/tmp/qcseriald.pid");
+		snprintf(g_status_file, sizeof(g_status_file),
+			 "/tmp/qcseriald.status");
+		snprintf(g_log_file, sizeof(g_log_file),
+			 "/tmp/qcseriald.log");
+	}
+}
 #define SYMLINK_PREFIX  "tty.qcserial-"
 #define DEV_DIR         "/dev"
 
@@ -111,7 +135,7 @@ static void signal_handler(int sig)
 
 static pid_t pid_file_read(void)
 {
-	FILE *f = fopen(PID_FILE, "r");
+	FILE *f = fopen(g_pid_file, "r");
 	pid_t pid = 0;
 
 	if (!f)
@@ -124,11 +148,11 @@ static pid_t pid_file_read(void)
 
 static int pid_file_write(pid_t pid)
 {
-	FILE *f = fopen(PID_FILE, "w");
+	FILE *f = fopen(g_pid_file, "w");
 
 	if (!f) {
 		fprintf(stderr, "Failed to write PID file %s: %s\n",
-			PID_FILE, strerror(errno));
+			g_pid_file, strerror(errno));
 		return -1;
 	}
 	fprintf(f, "%d\n", pid);
@@ -138,7 +162,7 @@ static int pid_file_write(pid_t pid)
 
 static void pid_file_remove(void)
 {
-	unlink(PID_FILE);
+	unlink(g_pid_file);
 }
 
 static int is_process_alive(pid_t pid)
@@ -1194,7 +1218,7 @@ static void write_status_file(void)
 	char tmp[256];
 	FILE *f;
 
-	snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_FILE);
+	snprintf(tmp, sizeof(tmp), "%s.tmp", g_status_file);
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
@@ -1211,7 +1235,7 @@ static void write_status_file(void)
 			b->func_name, health, u2p, p2u, b->link_name);
 	}
 	fclose(f);
-	rename(tmp, STATUS_FILE);
+	rename(tmp, g_status_file);
 }
 
 /* ── Health monitor + auto-restart loop ── */
@@ -1347,6 +1371,8 @@ static void set_adb_libusb_env(void)
 
 static int cmd_start(int foreground)
 {
+	init_runtime_paths();
+
 	pid_t existing = pid_file_read();
 
 	if (existing && is_process_alive(existing)) {
@@ -1400,7 +1426,7 @@ static int cmd_start(int foreground)
 		printf("Shutting down...\n");
 		shutdown_bridges();
 		pid_file_remove();
-		unlink(STATUS_FILE);
+		unlink(g_status_file);
 		printf("Done\n");
 		return 0;
 	}
@@ -1452,7 +1478,7 @@ static int cmd_start(int foreground)
 		_exit(1);
 	}
 
-	int logfd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	int logfd = open(g_log_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
 	if (logfd >= 0) {
 		dup2(logfd, STDOUT_FILENO);
@@ -1525,7 +1551,7 @@ static int cmd_start(int foreground)
 	printf("Daemon shutting down...\n");
 	shutdown_bridges();
 	pid_file_remove();
-	unlink(STATUS_FILE);
+	unlink(g_status_file);
 	printf("Done\n");
 	_exit(0);
 }
@@ -1534,6 +1560,8 @@ static int cmd_start(int foreground)
 
 static int cmd_stop(void)
 {
+	init_runtime_paths();
+
 	pid_t pid = pid_file_read();
 
 	if (!pid || !is_process_alive(pid)) {
@@ -1574,6 +1602,8 @@ static int cmd_stop(void)
 
 static int cmd_status(void)
 {
+	init_runtime_paths();
+
 	pid_t pid = pid_file_read();
 
 	if (!pid || !is_process_alive(pid)) {
@@ -1587,7 +1617,7 @@ static int cmd_status(void)
 	printf(UX_COLOR_GREEN "qcseriald is running" UX_COLOR_RESET
 	       " (PID %d)\n", pid);
 
-	FILE *f = fopen(STATUS_FILE, "r");
+	FILE *f = fopen(g_status_file, "r");
 
 	if (!f) {
 		printf("  (no status file — daemon may be starting up)\n");
@@ -1619,21 +1649,23 @@ static int cmd_status(void)
 
 static int cmd_printlog(int follow)
 {
-	if (access(LOG_FILE, R_OK) != 0) {
-		ux_err("No log file found at %s\n", LOG_FILE);
+	init_runtime_paths();
+
+	if (access(g_log_file, R_OK) != 0) {
+		ux_err("No log file found at %s\n", g_log_file);
 		return 1;
 	}
 
 	if (follow) {
-		execlp("tail", "tail", "-f", LOG_FILE, NULL);
+		execlp("tail", "tail", "-f", g_log_file, NULL);
 		perror("tail");
 		return 1;
 	}
 
-	FILE *f = fopen(LOG_FILE, "r");
+	FILE *f = fopen(g_log_file, "r");
 
 	if (!f) {
-		perror(LOG_FILE);
+		perror(g_log_file);
 		return 1;
 	}
 
@@ -1650,6 +1682,8 @@ static int cmd_printlog(int follow)
 
 int qcseriald_is_running(void)
 {
+	init_runtime_paths();
+
 	pid_t pid = pid_file_read();
 
 	return (pid > 0 && is_process_alive(pid));
@@ -1704,7 +1738,7 @@ int qcseriald_ensure_running(void)
 
 		usleep(500000);
 
-		f = fopen(STATUS_FILE, "r");
+		f = fopen(g_status_file, "r");
 		if (!f)
 			continue;
 
@@ -1734,7 +1768,7 @@ static int read_status_port(char *buf, size_t size, const char *prefix)
 	char line[512];
 	char key[64];
 
-	f = fopen(STATUS_FILE, "r");
+	f = fopen(g_status_file, "r");
 	if (!f)
 		return 0;
 
@@ -1798,7 +1832,7 @@ void print_qcseriald_help(FILE *out)
 	fprintf(out, "  stop               Stop running daemon\n");
 	fprintf(out, "  restart            Stop + start (clean reset)\n");
 	fprintf(out, "  status             Show running state and port health\n");
-	fprintf(out, "  log                Print daemon log (%s)\n", LOG_FILE);
+	fprintf(out, "  log                Print daemon log (%s)\n", g_log_file);
 	fprintf(out, "  log -f             Follow daemon log (tail -f)\n");
 }
 
@@ -1806,6 +1840,8 @@ void print_qcseriald_help(FILE *out)
 
 int qdl_qcseriald(int argc, char **argv)
 {
+	init_runtime_paths();
+
 	if (argc < 2) {
 		print_qcseriald_help(stderr);
 		return 1;
