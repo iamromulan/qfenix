@@ -1,10 +1,8 @@
-name: Build and Release
+name: Build
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+  pull_request:
 
 jobs:
   # Linux x64 - TRUE STATIC with Alpine/musl
@@ -572,50 +570,3 @@ jobs:
         with:
           name: macos-universal
           path: qfenix
-
-  create-release:
-    needs: [build-linux-x64, build-linux-arm64, build-linux-arm, build-macos-arm64, build-macos-x64, build-windows-x64, build-windows-x86, build-windows-arm64, macos-universal]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create release archives
-        run: |
-          cd artifacts
-
-          # Linux/macOS: tar.gz to preserve executable permission
-          for dir in linux-x64 linux-arm64 linux-arm macos-arm64 macos-x64 macos-universal; do
-            cd $dir
-            chmod +x qfenix
-            tar -czvf ../qfenix-${dir}.tar.gz qfenix
-            cd ..
-          done
-
-          # Windows: rename with platform suffix, no archive needed
-          for dir in windows-x64 windows-x86 windows-arm64; do
-            cp ${dir}/qfenix.exe qfenix-${dir}.exe
-          done
-
-          ls -la *.tar.gz *.exe
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/qfenix-linux-x64.tar.gz
-            artifacts/qfenix-linux-arm64.tar.gz
-            artifacts/qfenix-linux-arm.tar.gz
-            artifacts/qfenix-macos-arm64.tar.gz
-            artifacts/qfenix-macos-x64.tar.gz
-            artifacts/qfenix-macos-universal.tar.gz
-            artifacts/qfenix-windows-x64.exe
-            artifacts/qfenix-windows-x86.exe
-            artifacts/qfenix-windows-arm64.exe
-          draft: false
-          prerelease: true
