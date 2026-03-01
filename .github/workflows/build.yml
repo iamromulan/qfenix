@@ -564,9 +564,11 @@ jobs:
           echo "=== Verify universal binary ==="
           file qfenix
           lipo -info qfenix
+          chmod +x qfenix
+          tar -czvf qfenix-macos-universal.tar.gz qfenix
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-universal
-          path: qfenix
+          path: qfenix-macos-universal.tar.gz
