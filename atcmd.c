@@ -156,6 +156,11 @@ int at_send_cmd(struct at_session *sess, const char *cmd,
 }
 
 #else
+/* Windows compat for POSIX serial/sleep functions used in shared code */
+#define TCIOFLUSH 2
+#define tcflush(fd, queue) (void)(fd)
+#define usleep(us) Sleep((us) / 1000)
+
 /* Windows implementation stubs — uses CreateFile/DCB */
 
 struct at_session *at_open(const char *port, int timeout_ms)
