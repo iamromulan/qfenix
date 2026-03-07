@@ -42,7 +42,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.4"
+#define QCSERIALD_VERSION "1.0.5"
 
 /* ── Constants ── */
 
@@ -98,6 +98,7 @@ enum bridge_state {
 typedef struct {
 	int                         iface_num;
 	int                         pty_master;
+	int                         pty_slave;
 	char                        pty_name[256];
 	char                        link_name[256];
 	char                        func_name[32];
@@ -115,9 +116,12 @@ typedef struct {
 
 static _Atomic(int) g_running = 1;
 static const char *g_daemon_state = "starting";
+static int g_edl_detected;		/* 1 if EDL-mode device seen */
+static char g_edl_product[128];		/* product name of EDL device */
 
 static bridge_t g_bridges[MAX_INTERFACES];
 static int g_bridge_count;
+static int g_expected_bridges;  /* vendor-specific interfaces found (minus ADB) */
 
 static pthread_mutex_t g_exit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_exit_cond  = PTHREAD_COND_INITIALIZER;
@@ -281,7 +285,9 @@ static void *usb_to_pty(void *arg)
 	UInt8 buf[USB_BUF_SIZE];
 	IOReturn kr;
 	UInt32 len;
-	time_t last_good_read = time(NULL);
+	int notopen_count = 0;
+	time_t thread_start = time(NULL);
+	time_t last_good_read = thread_start;
 
 	atomic_store(&b->usb_to_pty_alive, 1);
 	printf("[%s] USB->PTY thread started\n", b->func_name);
@@ -297,13 +303,12 @@ static void *usb_to_pty(void *arg)
 				break;
 			}
 			if (kr == kIOReturnNotResponding) {
-				/* Transient during AT port probing —
-				 * retry with timeout. Genuine disconnect
-				 * if it persists for 30+ seconds. */
+				/* Transient hiccup — retry with timeout.
+				 * Genuine disconnect if it persists 5+s. */
 				(*b->iface)->ClearPipeStall(b->iface,
 							    b->pipe_in);
-				if (time(NULL) - last_good_read > 30) {
-					printf("[%s] USB->PTY: not responding for 30s, giving up\n",
+				if (time(NULL) - last_good_read > 5) {
+					printf("[%s] USB->PTY: not responding for 5s, giving up\n",
 					       b->func_name);
 					break;
 				}
@@ -312,19 +317,47 @@ static void *usb_to_pty(void *arg)
 			}
 			if (kr == (IOReturn)0xe00002c0 ||
 			    kr == (IOReturn)0xe00002eb) {
-				/* Common after USB re-enumeration —
-				 * retry indefinitely (monitor loop
-				 * handles real disconnect detection). */
+				/* Broken pipe / pipe stall — clear and
+				 * retry, but give up after 15s if we
+				 * never had a successful read (stale
+				 * handle from re-enumeration). */
+				notopen_count++;
+				if (notopen_count == 1 ||
+				    notopen_count == 100 ||
+				    notopen_count % 1000 == 0)
+					printf("[%s] USB->PTY ReadPipe: 0x%x (retry #%d)\n",
+					       b->func_name, kr,
+					       notopen_count);
+				if (time(NULL) - last_good_read > 15) {
+					printf("[%s] USB->PTY: pipe broken "
+					       "(0x%x, no data for %ds) "
+					       "— giving up\n",
+					       b->func_name, kr,
+					       (int)(time(NULL) -
+						     last_good_read));
+					break;
+				}
 				(*b->iface)->ClearPipeStall(b->iface,
 							    b->pipe_in);
 				usleep(10000);
 				continue;
 			}
-			fprintf(stderr, "[%s] USB->PTY ReadPipe error: 0x%x\n",
+			/* Unknown error — same timeout */
+			fprintf(stderr,
+				"[%s] USB->PTY ReadPipe error: 0x%x\n",
 				b->func_name, kr);
+			if (time(NULL) - last_good_read > 15) {
+				printf("[%s] USB->PTY: persistent error, "
+				       "no data for %ds — giving up\n",
+				       b->func_name,
+				       (int)(time(NULL) -
+					     last_good_read));
+				break;
+			}
 			usleep(10000);
 			continue;
 		}
+		notopen_count = 0;
 		last_good_read = time(NULL);
 		if (len > 0) {
 			ssize_t written = 0;
@@ -465,8 +498,11 @@ static int attempt_usb_recovery(io_service_t device_service)
 		return -1;
 	}
 
-	printf("Recovery: waiting for USB re-enumeration (3s)...\n");
-	sleep(3);
+	/* 5s needed for kernel to tear down old services, re-probe the
+	 * device, create new IOUSBHostInterface children, and populate
+	 * properties. */
+	printf("Recovery: waiting for USB re-enumeration (5s)...\n");
+	sleep(5);
 	return 0;
 }
 
@@ -474,6 +510,9 @@ static int attempt_usb_recovery(io_service_t device_service)
 
 static int setup_bridges(void)
 {
+	g_edl_detected = 0;
+	g_edl_product[0] = '\0';
+
 	CFMutableDictionaryRef match = IOServiceMatching("IOUSBHostDevice");
 
 	if (!match) {
@@ -515,6 +554,35 @@ static int setup_bridges(void)
 							 &matched_pid);
 					CFRelease(pid_ref);
 				}
+				/* Skip EDL devices — they use
+				 * Sahara/Firehose, not serial. */
+				if (is_edl_device((uint16_t)vid,
+						  (uint16_t)matched_pid)) {
+					g_edl_detected = 1;
+					CFStringRef prod =
+						IORegistryEntryCreateCFProperty(
+							candidate,
+							CFSTR("USB Product Name"),
+							kCFAllocatorDefault, 0);
+					if (prod) {
+						CFStringGetCString(prod,
+							g_edl_product,
+							sizeof(g_edl_product),
+							kCFStringEncodingUTF8);
+						CFRelease(prod);
+					} else {
+						snprintf(g_edl_product,
+							 sizeof(g_edl_product),
+							 "VID 0x%04x PID 0x%04x",
+							 vid, matched_pid);
+					}
+					printf("EDL device detected: %s "
+					       "(libusb port — skipping)\n",
+					       g_edl_product);
+					IOObjectRelease(candidate);
+					matched_vendor = NULL;
+					continue;
+				}
 				device = candidate;
 				break;
 			}
@@ -540,6 +608,13 @@ static int setup_bridges(void)
 		CFRelease(product);
 	}
 
+	/* IOUSBHostDevice appears in the IOKit registry before its pipe
+	 * endpoints are fully configured. Opening interfaces too early
+	 * results in ReadPipe returning kIOReturnNotOpen (0xe00002c0) on
+	 * every call. A 2s delay lets the USB host stack finish setting
+	 * up bulk endpoint transfers. */
+	sleep(2);
+
 	int known_diag_iface = get_diag_interface_num((uint16_t)matched_vid,
 						      (uint16_t)matched_pid);
 
@@ -555,6 +630,7 @@ static int setup_bridges(void)
 	}
 
 	int exclusive_access_hit = 0;
+	int iface_count = 0;
 	io_service_t child;
 
 	while ((child = IOIteratorNext(child_iter)) &&
@@ -615,6 +691,7 @@ static int setup_bridges(void)
 			continue;
 		}
 
+		iface_count++;
 		kr = (*iface)->USBInterfaceOpen(iface);
 		if (kr != kIOReturnSuccess) {
 			if (kr == (IOReturn)0xe00002c5)
@@ -670,8 +747,9 @@ static int setup_bridges(void)
 		cfmakeraw(&tio);
 		tcsetattr(master, TCSANOW, &tio);
 
+		/* Keep slave open so master writes don't EIO — preserves
+		 * modem data (including RDY URC) in PTY buffer. */
 		chmod(slave_name, 0666);
-		close(slave);
 
 		char func_buf[32];
 		const char *func;
@@ -703,6 +781,7 @@ static int setup_bridges(void)
 		memset(b, 0, sizeof(*b));
 		b->iface_num = iface_num;
 		b->pty_master = master;
+		b->pty_slave = slave;
 		strncpy(b->pty_name, slave_name, sizeof(b->pty_name) - 1);
 		strncpy(b->link_name, link, sizeof(b->link_name) - 1);
 		strncpy(b->func_name, func, sizeof(b->func_name) - 1);
@@ -730,15 +809,36 @@ static int setup_bridges(void)
 	}
 
 	IOObjectRelease(child_iter);
+	g_expected_bridges = iface_count;
+
+	/* If we got exclusive access errors, don't attempt USB
+	 * re-enumeration immediately — it creates broken pipe handles
+	 * (0xe00002c0) that never recover. Wait for kernel cleanup first,
+	 * then try re-enumeration as a last resort after 6 failed attempts. */
+	static int exclusive_retries;
 
 	if (g_bridge_count == 0 && exclusive_access_hit) {
-		printf("Exclusive access conflict — attempting USB recovery...\n");
-		if (attempt_usb_recovery(device) == 0) {
-			IOObjectRelease(device);
-			return setup_bridges();
+		exclusive_retries++;
+		if (exclusive_retries <= 6) {
+			printf("Exclusive access on all interfaces "
+			       "(attempt %d/6, waiting for kernel "
+			       "cleanup)...\n", exclusive_retries);
+		} else if (exclusive_retries == 7) {
+			printf("Exclusive access persists — trying "
+			       "USB re-enumeration...\n");
+			if (attempt_usb_recovery(device) == 0) {
+				IOObjectRelease(device);
+				return setup_bridges();
+			}
+			printf("Recovery failed — modem unplug/replug "
+			       "may be required\n");
+		} else {
+			printf("Exclusive access persists (attempt %d) "
+			       "— physical replug may be required\n",
+			       exclusive_retries);
 		}
-		fprintf(stderr,
-			"Recovery failed — modem unplug/replug may be required\n");
+	} else if (g_bridge_count > 0) {
+		exclusive_retries = 0;
 	}
 
 	IOObjectRelease(device);
@@ -816,19 +916,46 @@ static void probe_ports(void)
 	if (count == 0)
 		return;
 
-	printf("Probing %d unknown port(s) — trying AT command...\n", count);
+	printf("Probing %d unknown port(s)...\n", count);
 
-	for (int i = 0; i < count; i++) {
-		tcflush(fds[i], TCIOFLUSH);
-		write(fds[i], "AT\r", 3);
-	}
-
+	/* Drain any data buffered in PTY before we opened the slave.
+	 * This catches RDY URC if modem was already ready. */
 	char accum[MAX_INTERFACES][512];
 	int accum_len[MAX_INTERFACES];
 	int any_responded = 0;
 	time_t at_start;
 
 	memset(accum_len, 0, sizeof(accum_len));
+
+	for (int i = 0; i < count; i++) {
+		ssize_t n = read(fds[i], accum[i], sizeof(accum[i]) - 1);
+
+		if (n > 0) {
+			accum_len[i] = (int)n;
+			accum[i][n] = '\0';
+			if (strstr(accum[i], "RDY") ||
+			    strstr(accum[i], "OK") ||
+			    strstr(accum[i], "ERROR")) {
+				types[i] = PORT_AT;
+				any_responded = 1;
+				printf("  [%s] Buffered RDY/AT data — AT port\n",
+				       g_bridges[idx[i]].func_name);
+			} else if (strstr(accum[i], "$G")) {
+				types[i] = PORT_NMEA;
+				any_responded = 1;
+				printf("  [%s] Buffered NMEA data — GPS port\n",
+				       g_bridges[idx[i]].func_name);
+			}
+		}
+	}
+
+	/* Send AT on still-unknown ports. Only flush output. */
+	for (int i = 0; i < count; i++) {
+		if (types[i] != PORT_UNKNOWN)
+			continue;
+		tcflush(fds[i], TCOFLUSH);
+		write(fds[i], "AT\r", 3);
+	}
 
 	at_start = time(NULL);
 	while (time(NULL) - at_start < PROBE_AT_TIMEOUT &&
@@ -909,7 +1036,7 @@ static void probe_ports(void)
 				if (!atomic_load(&g_running))
 					break;
 
-				tcflush(fds[i], TCIOFLUSH);
+				tcflush(fds[i], TCOFLUSH);
 				write(fds[i], "AT\r", 3);
 
 				retry_start = time(NULL);
@@ -1153,8 +1280,12 @@ static void shutdown_bridges(void)
 	for (int i = 0; i < g_bridge_count; i++)
 		atomic_store(&g_bridges[i].state, BRIDGE_STOPPING);
 
-	/* Close PTY masters FIRST to unblock pty_to_usb threads */
+	/* Close PTY slaves and masters to unblock pty_to_usb threads */
 	for (int i = 0; i < g_bridge_count; i++) {
+		if (g_bridges[i].pty_slave >= 0) {
+			close(g_bridges[i].pty_slave);
+			g_bridges[i].pty_slave = -1;
+		}
 		if (g_bridges[i].pty_master >= 0) {
 			close(g_bridges[i].pty_master);
 			g_bridges[i].pty_master = -1;
@@ -1245,6 +1376,8 @@ static void write_status_file(void)
 
 	fprintf(f, "pid=%d\n", getpid());
 	fprintf(f, "state=%s\n", g_daemon_state);
+	if (g_edl_detected)
+		fprintf(f, "edl=%s\n", g_edl_product);
 	fprintf(f, "bridges=%d\n", g_bridge_count);
 	for (int i = 0; i < g_bridge_count; i++) {
 		bridge_t *b = &g_bridges[i];
@@ -1284,11 +1417,15 @@ static void run_monitor_loop(void)
 			shutdown_bridges();
 			g_daemon_state = "waiting";
 			write_status_file();
+			/* Fall through to rescan path below */
+		}
 
+		if (g_bridge_count == 0) {
+			/* No bridges — either daemon started before modem
+			 * was plugged in, or modem disconnected above. */
 			printf(UX_COLOR_YELLOW
-			       "Waiting for modem to reconnect...\n"
+			       "Waiting for modem...\n"
 			       UX_COLOR_RESET);
-
 			int retries_with_partial = 0;
 
 			while (atomic_load(&g_running)) {
@@ -1300,14 +1437,22 @@ static void run_monitor_loop(void)
 				if (!atomic_load(&g_running))
 					break;
 
-				if (setup_bridges() == 0) {
-					if (g_bridge_count < prev_bridge_count &&
-					    retries_with_partial < 3) {
+				if (setup_bridges() != 0) {
+					write_status_file();
+					continue;
+				}
+				{
+					int expected = prev_bridge_count > 0
+						? prev_bridge_count
+						: g_expected_bridges;
+
+					if (g_bridge_count < expected &&
+					    retries_with_partial < 5) {
 						printf(UX_COLOR_YELLOW
-						       "Partial reconnect (%d/%d bridges) — retrying...\n"
+						       "Partial setup (%d/%d interfaces) — retrying...\n"
 						       UX_COLOR_RESET,
 						       g_bridge_count,
-						       prev_bridge_count);
+						       expected);
 						shutdown_bridges();
 						retries_with_partial++;
 						continue;
@@ -1315,7 +1460,7 @@ static void run_monitor_loop(void)
 					probe_ports();
 					g_daemon_state = "running";
 					printf(UX_COLOR_GREEN
-					       "Modem reconnected — %d bridge(s) active\n"
+					       "Modem found — %d bridge(s) active\n"
 					       UX_COLOR_RESET,
 					       g_bridge_count);
 					prev_bridge_count = g_bridge_count;
@@ -1391,29 +1536,82 @@ static void set_adb_libusb_env(void)
 		UX_COLOR_RESET);
 }
 
+/* ── Kill all stale qcseriald instances ──
+ *
+ * PID file checks are insufficient because instances can be started from
+ * different paths (standalone binary, qfenix subcommand, /usr/local/bin)
+ * each writing to different PID file locations.  This function scans the
+ * process table by name and kills everything that isn't us.
+ */
+
+static void kill_stale_instances(void)
+{
+	pid_t self = getpid();
+	FILE *fp = popen(
+		"pgrep -f 'qcseriald (start|start --foreground)'", "r");
+	if (!fp)
+		return;
+
+	char line[32];
+	int killed = 0;
+
+	while (fgets(line, sizeof(line), fp)) {
+		pid_t pid = (pid_t)atoi(line);
+
+		if (pid <= 0 || pid == self)
+			continue;
+
+		if (kill(pid, SIGTERM) == 0) {
+			printf("Killed stale qcseriald instance (PID %d)\n",
+			       pid);
+			killed++;
+		}
+	}
+	pclose(fp);
+
+	if (killed > 0) {
+		usleep(500000);  /* 500ms for graceful exit */
+		fp = popen(
+			"pgrep -f 'qcseriald (start|start --foreground)'",
+			"r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				pid_t pid = (pid_t)atoi(line);
+
+				if (pid > 0 && pid != self)
+					kill(pid, SIGKILL);
+			}
+			pclose(fp);
+		}
+	}
+
+	unlink("/var/run/qcseriald.pid");
+	unlink("/tmp/qcseriald.pid");
+}
+
+/* ── Root privilege check ── */
+
+static int require_root(const char *command)
+{
+	if (getuid() == 0)
+		return 0;
+	ux_err("'qfenix qcseriald %s' requires root privileges.\n", command);
+	fprintf(stderr, "Run with: " UX_COLOR_GREEN
+		"sudo qfenix qcseriald %s" UX_COLOR_RESET "\n", command);
+	return 1;
+}
+
 /* ── cmd_start ── */
 
 static int cmd_start(int foreground)
 {
+	if (require_root("start"))
+		return 1;
+
 	init_runtime_paths();
 
-	pid_t existing = pid_file_read();
-
-	if (existing && is_process_alive(existing)) {
-		ux_warn("qcseriald already running (PID %d)\n", existing);
-		fprintf(stderr,
-			"Use '" UX_COLOR_GREEN "qfenix qcseriald stop"
-			UX_COLOR_RESET "' first, or '"
-			UX_COLOR_GREEN "qfenix qcseriald status"
-			UX_COLOR_RESET "' for details.\n");
-		return 1;
-	}
-
-	if (existing) {
-		printf("Cleaning up stale PID file (PID %d no longer running)\n",
-		       existing);
-		pid_file_remove();
-	}
+	/* Kill ALL existing qcseriald instances (from any path/PID file) */
+	kill_stale_instances();
 	resolve_symlink_dir();
 	cleanup_stale_symlinks();
 
@@ -1588,6 +1786,9 @@ static int cmd_start(int foreground)
 
 static int cmd_stop(void)
 {
+	if (require_root("stop"))
+		return 1;
+
 	init_runtime_paths();
 	resolve_symlink_dir();
 
@@ -1672,6 +1873,11 @@ static int cmd_status(void)
 				printf("  " UX_COLOR_YELLOW
 				       "Starting up..."
 				       UX_COLOR_RESET "\n");
+		} else if (strncmp(line, "edl=", 4) == 0) {
+			printf("  " UX_COLOR_YELLOW
+			       "EDL device detected: %s "
+			       "(libusb port — not bridged)"
+			       UX_COLOR_RESET "\n", line + 4);
 		} else if (strncmp(line, "bridges=", 8) == 0) {
 			printf("  " UX_COLOR_BOLD "Bridges:" UX_COLOR_RESET
 			       " %s\n", line + 8);
@@ -1896,6 +2102,9 @@ int qdl_qcseriald(int argc, char **argv)
 	} else if (strcmp(argv[1], "stop") == 0) {
 		return cmd_stop();
 	} else if (strcmp(argv[1], "restart") == 0) {
+		if (require_root("restart"))
+			return 1;
+
 		int foreground = 0;
 
 		cmd_stop();
