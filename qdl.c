@@ -1265,6 +1265,9 @@ static int list_com_ports(FILE *out)
 
 #elif defined(__linux__)
 
+#include <termios.h>
+#include <poll.h>
+
 static int list_diag_ports(FILE *out)
 {
 	const char *base = "/sys/bus/usb/devices";
