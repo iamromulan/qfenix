@@ -172,13 +172,14 @@ static uint32_t parse_ascii_hex32(const char *s)
 /**
  * decode_programmer_archive() - Attempt to decode a programmer CPIO archive
  * @blob: Loaded image to be decoded as archive
- * @images: List of Sahara images, with @images[0] populated
+ * @images: List of Sahara images to populate
  *
- * The single blob provided in @images[0] might be a CPIO archive containing
- * Sahara images, in files with names in the format "<id>:<filename>". Load
- * each such Sahara image into the relevant spot in the @images array.
+ * The blob might be a CPIO archive containing Sahara images, in files with
+ * names in the format "<id>:<filename>". Load each such Sahara image into the
+ * relevant spot in the @images array.
  *
- * The original blob (in @images[0]) is freed once it has been consumed.
+ * The blob is always consumed (freed) on both success and error paths.
+ * On error, any partially-populated @images entries are also freed.
  *
  * Returns: 0 if no archive was found, 1 if archive was decoded, -1 on error
  */
@@ -200,13 +201,13 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 	for (;;) {
 		if (ptr + sizeof(*hdr) > end) {
 			ux_err("programmer archive is truncated\n");
-			return -1;
+			goto err;
 		}
 		hdr = ptr;
 
 		if (memcmp(hdr->c_magic, "070701", 6)) {
 			ux_err("expected cpio header in programmer archive\n");
-			return -1;
+			goto err;
 		}
 
 		filesize = parse_ascii_hex32(hdr->c_filesize);
@@ -215,12 +216,12 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 		ptr += sizeof(*hdr);
 		if (ptr + namesize > end || ptr + filesize + namesize > end) {
 			ux_err("programmer archive is truncated\n");
-			return -1;
+			goto err;
 		}
 
 		if (namesize > sizeof(name)) {
 			ux_err("unexpected filename length in progammer archive\n");
-			return -1;
+			goto err;
 		}
 		memcpy(name, ptr, namesize);
 
@@ -231,7 +232,7 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 		id = strtoul(tok, NULL, 0);
 		if (id == 0 || id >= MAPPING_SZ) {
 			ux_err("invalid image id \"%s\" in programmer archive\n", tok);
-			return -1;
+			goto err;
 		}
 
 		ptr += namesize;
@@ -253,6 +254,13 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 	blob->len = 0;
 
 	return 1;
+
+err:
+	sahara_images_free(images, MAPPING_SZ);
+	free(blob->ptr);
+	blob->ptr = NULL;
+	blob->len = 0;
+	return -1;
 }
 
 /**
@@ -357,6 +365,10 @@ static int decode_sahara_config(struct sahara_image *blob, struct sahara_image *
 	return 1;
 
 err_free_doc:
+	sahara_images_free(images, MAPPING_SZ);
+	free(blob->ptr);
+	blob->ptr = NULL;
+	blob->len = 0;
 	xmlFreeDoc(doc);
 	free(blob_name_buf);
 	return -1;
@@ -4662,6 +4674,7 @@ out_cleanup:
 
 	qdl_close(qdl);
 	free_firehose_ops();
+	sahara_images_free(sahara_images, MAPPING_SZ);
 	free_programs();
 	free_patches();
 

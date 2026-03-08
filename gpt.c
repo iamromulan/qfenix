@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -444,8 +445,8 @@ static int gpt_load_table_from_partition(struct qdl_device *qdl, unsigned int ph
 	uint8_t buf[4096];
 	struct read_op op;
 	unsigned int offset;
-	unsigned int lba;
-	char lba_buf[10];
+	uint64_t lba;
+	char lba_buf[21];
 	uint16_t name_utf16le[36];
 	char name[36 * 4];
 	int ret;
@@ -482,7 +483,7 @@ static int gpt_load_table_from_partition(struct qdl_device *qdl, unsigned int ph
 
 		if (offset == 0) {
 			lba = gpt.part_entry_lba + i * gpt.part_entry_size / qdl->sector_size;
-			sprintf(lba_buf, "%u", lba);
+			snprintf(lba_buf, sizeof(lba_buf), "%" PRIu64, lba);
 			op.start_sector = lba_buf;
 
 			memset(buf, 0, sizeof(buf));
