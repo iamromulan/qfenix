@@ -1656,7 +1656,7 @@ static int qdl_diag2edl(int argc, char **argv)
 			fprintf(stderr, "\rWaiting for DIAG port... "
 				"(Ctrl+C to abort) [%ds]", elapsed);
 			fflush(stderr);
-			sleep(1);
+			usleep(1000000);
 		}
 		if (printed)
 			fprintf(stderr, "\n");

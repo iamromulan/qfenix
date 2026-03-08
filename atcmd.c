@@ -886,7 +886,7 @@ static struct at_session *at_session_open(const char *serial,
 				fprintf(stderr, "\rWaiting for AT port... "
 					"(Ctrl+C to abort) [%ds]", elapsed);
 				fflush(stderr);
-				sleep(1);
+				usleep(1000000);
 			}
 			if (printed)
 				fprintf(stderr, "\n");
