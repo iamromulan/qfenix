@@ -291,6 +291,7 @@ int at_detect_port(char *buf, size_t size, const char *serial)
 				cfmakeraw(&tio);
 				cfsetspeed(&tio, B115200);
 				tio.c_cflag |= CLOCAL | CREAD | CS8;
+				tio.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
 				tcsetattr(fd, TCSANOW, &tio);
 				tcflush(fd, TCIOFLUSH);
 

@@ -1386,8 +1386,51 @@ static int list_diag_ports(FILE *out)
 }
 
 /*
+ * Probe a serial port with AT command.
+ * Returns 1 if port responds to AT (OK or ERROR), 0 otherwise (NMEA etc).
+ */
+static int probe_at_port(const char *port_path)
+{
+	int fd;
+	struct termios tio;
+	struct pollfd pfd;
+	char resp[128] = {0};
+	int ret;
+
+	fd = open(port_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+	if (fd < 0)
+		return -1;
+
+	memset(&tio, 0, sizeof(tio));
+	cfmakeraw(&tio);
+	cfsetspeed(&tio, B115200);
+	tio.c_cflag |= CLOCAL | CREAD | CS8;
+	tio.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
+	tcsetattr(fd, TCSANOW, &tio);
+	tcflush(fd, TCIOFLUSH);
+
+	write(fd, "AT\r", 3);
+
+	pfd.fd = fd;
+	pfd.events = POLLIN;
+	ret = poll(&pfd, 1, 500);
+	if (ret > 0 && (pfd.revents & POLLIN)) {
+		int n = read(fd, resp, sizeof(resp) - 1);
+
+		if (n > 0)
+			resp[n] = '\0';
+	}
+
+	close(fd);
+
+	if (strstr(resp, "OK") || strstr(resp, "ERROR"))
+		return 1;
+	return 0;
+}
+
+/*
  * List non-DIAG serial ports from Qualcomm USB devices on Linux.
- * These are typically AT command and NMEA ports.
+ * Probes each port to classify as AT or NMEA.
  */
 static int list_at_ports(FILE *out)
 {
@@ -1396,8 +1439,15 @@ static int list_at_ports(FILE *out)
 	struct dirent *de, *de2;
 	char path[512], line[256];
 	FILE *fp;
-	int count = 0;
-	int printed_header = 0;
+	int at_count = 0, nmea_count = 0;
+	int at_header = 0, nmea_header = 0;
+	/* Collect ports first, then print (AT before NMEA) */
+	struct {
+		char path[300];
+		int vid, pid, iface;
+		int is_at;	/* 1=AT, 0=NMEA/other, -1=cant open */
+	} ports[32];
+	int port_count = 0;
 
 	busdir = opendir(base);
 	if (!busdir)
@@ -1445,6 +1495,8 @@ static int list_at_ports(FILE *out)
 
 		/* Scan all interfaces EXCEPT the DIAG interface */
 		for (iface_num = 0; iface_num < 16; iface_num++) {
+			char port_path[300];
+
 			if (iface_num == diag_iface)
 				continue;
 
@@ -1454,6 +1506,7 @@ static int list_at_ports(FILE *out)
 			if (!infdir)
 				continue;
 
+			port_path[0] = '\0';
 			while ((de2 = readdir(infdir)) != NULL) {
 				char ttypath[520];
 				DIR *ttydir;
@@ -1461,14 +1514,8 @@ static int list_at_ports(FILE *out)
 
 				if (strncmp(de2->d_name, "ttyUSB", 6) == 0 ||
 				    strncmp(de2->d_name, "ttyACM", 6) == 0) {
-					if (!printed_header) {
-						fprintf(out, "AT/serial devices:\n");
-						printed_header = 1;
-					}
-					fprintf(out, "  /dev/%-12s  %04x:%04x  iface %d  USB\n",
-						de2->d_name, vid, pid,
-						iface_num);
-					count++;
+					snprintf(port_path, sizeof(port_path),
+						 "/dev/%s", de2->d_name);
 					break;
 				}
 
@@ -1483,26 +1530,67 @@ static int list_at_ports(FILE *out)
 					while ((de3 = readdir(ttydir)) != NULL) {
 						if (strncmp(de3->d_name, "ttyUSB", 6) == 0 ||
 						    strncmp(de3->d_name, "ttyACM", 6) == 0) {
-							if (!printed_header) {
-								fprintf(out, "AT/serial devices:\n");
-								printed_header = 1;
-							}
-							fprintf(out, "  /dev/%-12s  %04x:%04x  iface %d  USB\n",
-								de3->d_name, vid, pid,
-								iface_num);
-							count++;
+							snprintf(port_path,
+								 sizeof(port_path),
+								 "/dev/%s",
+								 de3->d_name);
 							break;
 						}
 					}
 					closedir(ttydir);
+					if (port_path[0])
+						break;
 				}
 			}
 			closedir(infdir);
+
+			if (port_path[0] && port_count < 32) {
+				snprintf(ports[port_count].path,
+					 sizeof(ports[port_count].path),
+					 "%s", port_path);
+				ports[port_count].vid = vid;
+				ports[port_count].pid = pid;
+				ports[port_count].iface = iface_num;
+				ports[port_count].is_at =
+					probe_at_port(port_path);
+				port_count++;
+			}
 		}
 	}
 
 	closedir(busdir);
-	return count;
+
+	/* Print AT ports first */
+	for (int i = 0; i < port_count; i++) {
+		if (ports[i].is_at != 1)
+			continue;
+		if (!at_header) {
+			fprintf(out, "AT devices:\n");
+			at_header = 1;
+		}
+		fprintf(out, "  %-18s  %04x:%04x  iface %d  USB\n",
+			ports[i].path, ports[i].vid, ports[i].pid,
+			ports[i].iface);
+		at_count++;
+	}
+
+	/* Then NMEA/other ports */
+	for (int i = 0; i < port_count; i++) {
+		if (ports[i].is_at != 0)
+			continue;
+		if (!nmea_header) {
+			if (at_count > 0)
+				fprintf(out, "\n");
+			fprintf(out, "NMEA/other devices:\n");
+			nmea_header = 1;
+		}
+		fprintf(out, "  %-18s  %04x:%04x  iface %d  USB\n",
+			ports[i].path, ports[i].vid, ports[i].pid,
+			ports[i].iface);
+		nmea_count++;
+	}
+
+	return at_count + nmea_count;
 }
 
 static int list_edl_ports(FILE *out)
