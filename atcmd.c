@@ -868,10 +868,30 @@ static struct at_session *at_session_open(const char *serial,
 	struct at_session *sess;
 
 	if (!port) {
+#ifdef __APPLE__
 		if (!at_detect_port(port_buf, sizeof(port_buf), serial)) {
 			ux_err("No AT port found. Use -p to specify manually.\n");
 			return NULL;
 		}
+#else
+		{
+			int printed = 0;
+			time_t start = time(NULL);
+
+			while (!at_detect_port(port_buf, sizeof(port_buf), serial)) {
+				int elapsed = (int)(time(NULL) - start);
+
+				if (!printed)
+					printed = 1;
+				fprintf(stderr, "\rWaiting for AT port... "
+					"(Ctrl+C to abort) [%ds]", elapsed);
+				fflush(stderr);
+				sleep(1);
+			}
+			if (printed)
+				fprintf(stderr, "\n");
+		}
+#endif
 		port = port_buf;
 		ux_info("Using AT port: %s\n", port);
 	}

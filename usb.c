@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,6 +197,7 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 	bool wait_printed = false;
 	bool diag_attempted = false;
 	bool found = false;
+	time_t wait_start = 0;
 	ssize_t n;
 	int ret;
 	int i;
@@ -231,8 +233,11 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 
 		libusb_free_device_list(devs, 1);
 
-		if (found)
+		if (found) {
+			if (wait_printed)
+				fprintf(stderr, "\n");
 			return 0;
+		}
 
 #ifdef _WIN32
 		/*
@@ -265,9 +270,13 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 		}
 
 		if (!wait_printed) {
-			ux_info("Waiting for EDL device\n");
+			wait_start = time(NULL);
 			wait_printed = true;
 		}
+		fprintf(stderr, "\rWaiting for EDL device... "
+			"(Ctrl+C to abort) [%ds]",
+			(int)(time(NULL) - wait_start));
+		fflush(stderr);
 
 		usleep(250000);
 	}

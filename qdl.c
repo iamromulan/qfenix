@@ -18,6 +18,7 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "qdl.h"
@@ -1637,10 +1638,30 @@ static int qdl_diag2edl(int argc, char **argv)
 	if (qdl_debug)
 		print_version();
 
+#ifdef __APPLE__
 	if (!diag_is_device_in_diag_mode(serial)) {
 		fprintf(stderr, "No device found in DIAG mode\n");
 		return 1;
 	}
+#else
+	{
+		int printed = 0;
+		time_t start = time(NULL);
+
+		while (!diag_is_device_in_diag_mode(serial)) {
+			int elapsed = (int)(time(NULL) - start);
+
+			if (!printed)
+				printed = 1;
+			fprintf(stderr, "\rWaiting for DIAG port... "
+				"(Ctrl+C to abort) [%ds]", elapsed);
+			fflush(stderr);
+			sleep(1);
+		}
+		if (printed)
+			fprintf(stderr, "\n");
+	}
+#endif
 
 	printf("Device in DIAG mode, switching to EDL...\n");
 	if (diag_switch_to_edl(serial) < 0) {
@@ -2545,6 +2566,7 @@ static void print_readall_help(FILE *out)
 
 	fprintf(out, "Usage: %s readall [-L dir | <programmer>] [options]\n", __progname);
 	fprintf(out, "\nDump all partitions to individual files.\n");
+	fprintf(out, "Also generates a rawprogram XML file in the output directory.\n");
 	fprintf(out, "\nOptions:\n");
 	fprintf(out, "  -o, --output=DIR        Output directory (default: .)\n");
 	fprintf(out, "      --single-file=FILE  Dump entire storage as one file\n");
@@ -2642,10 +2664,13 @@ static int qdl_readall(int argc, char **argv)
 		return 1;
 	}
 
-	if (single_file)
+	if (single_file) {
 		ret = gpt_read_full_storage(qdl, single_file);
-	else
+	} else {
 		ret = gpt_read_all_partitions(qdl, outdir);
+		if (!ret)
+			gpt_make_xml(qdl, outdir, false, true);
+	}
 
 	firehose_session_close(qdl, true);
 	free(programmer);
@@ -4971,8 +4996,8 @@ int main(int argc, char **argv)
 
 	ux_init();
 
-#ifdef __APPLE__
-	/* macOS requires root for USB device access (libusb/IOKit) */
+#if defined(__APPLE__) || defined(__linux__)
+	/* macOS/Linux require root for USB/serial device access */
 	if (getuid() != 0) {
 		char **new_argv = malloc((argc + 2) * sizeof(char *));
 

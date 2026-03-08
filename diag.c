@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "diag.h"
@@ -606,10 +607,30 @@ struct diag_session *diag_open(const char *serial)
 	if (serial && (serial[0] == '/' || strncmp(serial, "COM", 3) == 0)) {
 		snprintf(port, sizeof(port), "%s", serial);
 	} else {
+#ifdef __APPLE__
 		if (!diag_detect_port(port, sizeof(port), serial)) {
 			ux_err("no DIAG port detected\n");
 			return NULL;
 		}
+#else
+		{
+			int printed = 0;
+			time_t start = time(NULL);
+
+			while (!diag_detect_port(port, sizeof(port), serial)) {
+				int elapsed = (int)(time(NULL) - start);
+
+				if (!printed)
+					printed = 1;
+				fprintf(stderr, "\rWaiting for DIAG port... "
+					"(Ctrl+C to abort) [%ds]", elapsed);
+				fflush(stderr);
+				sleep(1);
+			}
+			if (printed)
+				fprintf(stderr, "\n");
+		}
+#endif
 		ux_info("detected DIAG port: %s\n", port);
 	}
 
