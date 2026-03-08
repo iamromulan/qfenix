@@ -241,7 +241,7 @@ int at_detect_port(char *buf, size_t size, const char *serial)
 			if (!infdir)
 				continue;
 
-			while ((de2 = readdir(infdir)) != NULL) {
+			while ((de2 = readdir(infdir)) != NULL && !found) {
 				char port_path[300];
 				int fd;
 				struct termios tio;
@@ -249,12 +249,38 @@ int at_detect_port(char *buf, size_t size, const char *serial)
 				char resp[128] = {0};
 				int resp_len = 0, ret;
 
-				if (strncmp(de2->d_name, "ttyUSB", 6) != 0 &&
-				    strncmp(de2->d_name, "ttyACM", 6) != 0)
-					continue;
+				if (strncmp(de2->d_name, "ttyUSB", 6) == 0 ||
+				    strncmp(de2->d_name, "ttyACM", 6) == 0) {
+					snprintf(port_path, sizeof(port_path),
+						 "/dev/%s", de2->d_name);
+				} else if (strncmp(de2->d_name, "tty", 3) == 0 &&
+					   strlen(de2->d_name) == 3) {
+					/* Modern kernel: tty/ subdirectory */
+					char ttypath[520];
+					DIR *ttydir;
+					struct dirent *de3;
 
-				snprintf(port_path, sizeof(port_path),
-					 "/dev/%s", de2->d_name);
+					snprintf(ttypath, sizeof(ttypath),
+						 "%.511s/tty", path);
+					ttydir = opendir(ttypath);
+					if (!ttydir)
+						continue;
+
+					port_path[0] = '\0';
+					while ((de3 = readdir(ttydir))) {
+						if (strncmp(de3->d_name, "ttyUSB", 6) == 0 ||
+						    strncmp(de3->d_name, "ttyACM", 6) == 0) {
+							snprintf(port_path, sizeof(port_path),
+								 "/dev/%s", de3->d_name);
+							break;
+						}
+					}
+					closedir(ttydir);
+					if (!port_path[0])
+						continue;
+				} else {
+					continue;
+				}
 
 				/* Probe with AT command */
 				fd = open(port_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -285,7 +311,6 @@ int at_detect_port(char *buf, size_t size, const char *serial)
 				    strstr(resp, "ERROR")) {
 					snprintf(buf, size, "%s", port_path);
 					found = 1;
-					break;
 				}
 			}
 			closedir(infdir);
