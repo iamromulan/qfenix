@@ -5350,6 +5350,14 @@ int main(int argc, char **argv)
 {
 	int ret;
 
+	/*
+	 * When stdout is a pipe (e.g. GUI subprocess), it defaults to
+	 * fully-buffered, causing output to be trapped until process exit.
+	 * Switch to line-buffered so each printf("\n") flushes immediately.
+	 */
+	if (!isatty(STDOUT_FILENO))
+		setvbuf(stdout, NULL, _IOLBF, 0);
+
 	ux_init();
 
 #if defined(__APPLE__) || defined(__linux__)

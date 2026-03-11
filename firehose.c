@@ -1190,6 +1190,17 @@ int firehose_power(struct qdl_device *qdl, const char *mode, int delay)
 	if (ret < 0)
 		return -1;
 
+	/*
+	 * For reset/off, the device will reboot and disconnect from USB.
+	 * On macOS, libusb_bulk_transfer() can hang indefinitely when the
+	 * USB device disappears (IOKit backend issue), so skip waiting for
+	 * the ACK — the command was sent, there's nothing useful to read.
+	 */
+	if (strcmp(mode, "reset") == 0 || strcmp(mode, "off") == 0) {
+		ux_info("power %s command sent\n", mode);
+		return 0;
+	}
+
 	ret = firehose_read(qdl, 5000, firehose_generic_parser, NULL);
 	if (ret < 0)
 		ux_err("failed to send power command '%s'\n", mode);

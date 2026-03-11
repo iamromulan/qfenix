@@ -152,10 +152,18 @@ int qdl_atconsole(int argc, char **argv)
 	timeouts.WriteTotalTimeoutMultiplier = 0;
 	SetCommTimeouts((HANDLE)sess->fd, &timeouts);
 
-	if (set_raw_mode_win() < 0) {
-		ux_err("Failed to set console raw mode\n");
-		at_close(sess);
-		return 1;
+	hIn = GetStdHandle(STD_INPUT_HANDLE);
+
+	/*
+	 * Raw mode disables echo and line buffering on a real console.
+	 * When stdin is a pipe (e.g. GUI subprocess), skip it.
+	 */
+	if (GetFileType(hIn) == FILE_TYPE_CHAR) {
+		if (set_raw_mode_win() < 0) {
+			ux_err("Failed to set console raw mode\n");
+			at_close(sess);
+			return 1;
+		}
 	}
 
 	printf("Connected to %s (type 'exit' to quit)\r\n", port);
@@ -171,8 +179,13 @@ int qdl_atconsole(int argc, char **argv)
 		return 1;
 	}
 
-	/* Main thread: console input loop */
-	hIn = GetStdHandle(STD_INPUT_HANDLE);
+	/*
+	 * Main thread: input loop.
+	 * Console mode uses ReadConsoleInputA for key events.
+	 * Pipe mode (GUI subprocess) uses ReadFile for raw bytes.
+	 */
+	if (GetFileType(hIn) != FILE_TYPE_CHAR)
+		goto pipe_input;
 
 	for (;;) {
 		INPUT_RECORD rec;
@@ -232,7 +245,50 @@ int qdl_atconsole(int argc, char **argv)
 			}
 		}
 	}
+	goto shutdown;
 
+pipe_input:
+	/* Pipe mode: stdin is not a console (e.g. GUI subprocess) */
+	for (;;) {
+		char ch;
+		DWORD n;
+
+		if (!ReadFile(hIn, &ch, 1, &n, NULL) || n == 0)
+			break;
+
+		if (ch == '\r' || ch == '\n') {
+			DWORD w;
+
+			WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),
+				  "\r\n", 2, &w, NULL);
+
+			line_buf[line_len] = '\0';
+
+			if (strcmp(line_buf, "exit") == 0)
+				break;
+
+			if (line_len > 0) {
+				DWORD written;
+				HANDLE hSerial = (HANDLE)sess->fd;
+
+				WriteFile(hSerial, line_buf, line_len,
+					  &written, NULL);
+				WriteFile(hSerial, "\r", 1,
+					  &written, NULL);
+			}
+			line_len = 0;
+		} else if (ch >= ' ' && ch <= '~') {
+			if (line_len < (int)sizeof(line_buf) - 1) {
+				DWORD w;
+
+				line_buf[line_len++] = ch;
+				WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),
+					  &ch, 1, &w, NULL);
+			}
+		}
+	}
+
+shutdown:
 	/* Shutdown */
 	g_quit = 1;
 	WaitForSingleObject(hThread, 2000);
@@ -336,6 +392,13 @@ int qdl_atconsole(int argc, char **argv)
 		ux_info("Auto-detected AT port: %s\n", port);
 	}
 
+	/*
+	 * When stdout is a pipe (GUI subprocess), disable buffering so
+	 * output appears immediately instead of being delayed until exit.
+	 */
+	if (!isatty(STDOUT_FILENO))
+		setvbuf(stdout, NULL, _IONBF, 0);
+
 	sess = at_open(port, 10000);
 	if (!sess) {
 		ux_err("Failed to open %s: %s\n", port, strerror(errno));
@@ -343,7 +406,12 @@ int qdl_atconsole(int argc, char **argv)
 	}
 	sess->debug = debug;
 
-	if (set_raw_mode() < 0) {
+	/*
+	 * Raw mode disables echo and line buffering on a real terminal.
+	 * When stdin is a pipe (e.g. GUI subprocess), skip it — pipes
+	 * don't support termios and the poll() loop works fine without it.
+	 */
+	if (isatty(STDIN_FILENO) && set_raw_mode() < 0) {
 		ux_err("Failed to set terminal raw mode\n");
 		at_close(sess);
 		return 1;

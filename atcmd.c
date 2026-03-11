@@ -843,14 +843,15 @@ static int atcmd_raw(struct at_session *sess, const char *command)
 		if (line[0] == '\0')
 			continue;
 
-		if (strncmp(line, "OK", 2) == 0)
+		if (strncmp(line, "OK", 2) == 0) {
+			printf("%s\n", line);
 			return 0;
+		}
 		if (strncmp(line, "ERROR", 5) == 0 ||
 		    strncmp(line, "+CME ERROR", 10) == 0 ||
 		    strncmp(line, "+CMS ERROR", 10) == 0 ||
 		    strncmp(line, "COMMAND NOT SUPPORT", 19) == 0) {
-			if (sess->debug)
-				printf("%s\n", line);
+			printf("%s\n", line);
 			return -1;
 		}
 		printf("%s\n", line);

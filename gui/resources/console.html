@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>QFenix Console</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #1e1e1e;
+  }
+  #terminal {
+    width: 100%;
+    height: 100%;
+  }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="xterm.min.js"></script>
+<script src="xterm-addon-fit.min.js"></script>
+<script>
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: "'SF Mono', 'Menlo', 'Consolas', 'DejaVu Sans Mono', monospace",
+    theme: {
+      background: '#1e1e1e',
+      foreground: '#d4d4d4',
+      cursor: '#d4d4d4',
+      selectionBackground: '#264f78',
+      black: '#1e1e1e',
+      red: '#f44747',
+      green: '#6a9955',
+      yellow: '#dcdcaa',
+      blue: '#569cd6',
+      magenta: '#c586c0',
+      cyan: '#4ec9b0',
+      white: '#d4d4d4',
+      brightBlack: '#808080',
+      brightRed: '#f44747',
+      brightGreen: '#6a9955',
+      brightYellow: '#dcdcaa',
+      brightBlue: '#569cd6',
+      brightMagenta: '#c586c0',
+      brightCyan: '#4ec9b0',
+      brightWhite: '#ffffff'
+    },
+    scrollback: 10000,
+    convertEol: true,
+    allowProposedApi: true
+  });
+
+  var fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+
+  /* Re-fit on window resize */
+  window.addEventListener('resize', function() {
+    fitAddon.fit();
+  });
+
+  /* Forward user input to the C++ side via custom URL scheme */
+  term.onData(function(data) {
+    /* Base64-encode the input data for safe URL transport */
+    var b64 = btoa(unescape(encodeURIComponent(data)));
+    window.location.href = 'qfenix-stdin://' + b64;
+  });
+
+  /* Welcome message */
+  term.write('\x1b[38;5;121mQFenix Console\x1b[0m\r\n');
+  term.write('Ready. Select an operation from the Operations tab.\r\n\r\n');
+</script>
+</body>
+</html>
