@@ -62,6 +62,7 @@ void ux_init(void)
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
 	HANDLE hOut, hErr;
 	DWORD mode;
+	char *env;
 	int columns;
 
 	hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -70,6 +71,15 @@ void ux_init(void)
 	if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
 		columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
 		ux_width = MIN(columns, UX_PROGRESS_SIZE_MAX);
+	}
+
+	/* Allow COLUMNS env var to override (e.g. GUI subprocess with piped stdout) */
+	env = getenv("COLUMNS");
+	if (env) {
+		int cols = atoi(env);
+
+		if (cols > 0)
+			ux_width = MIN((unsigned int)cols, UX_PROGRESS_SIZE_MAX);
 	}
 
 	if (getenv("NO_COLOR"))
@@ -86,6 +96,12 @@ void ux_init(void)
 		if (SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
 			ux_color_stderr = true;
 	}
+
+	/* FORCE_COLOR overrides console mode check (e.g. GUI subprocess) */
+	if (getenv("FORCE_COLOR")) {
+		ux_color_stdout = true;
+		ux_color_stderr = true;
+	}
 }
 
 #else
@@ -93,17 +109,33 @@ void ux_init(void)
 void ux_init(void)
 {
 	struct winsize w;
+	char *env;
 	int ret;
 
 	ret = ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
 	if (!ret)
 		ux_width = MIN(w.ws_col, UX_PROGRESS_SIZE_MAX);
 
+	/* Allow COLUMNS env var to override (e.g. GUI subprocess with piped stdout) */
+	env = getenv("COLUMNS");
+	if (env) {
+		int cols = atoi(env);
+
+		if (cols > 0)
+			ux_width = MIN((unsigned int)cols, UX_PROGRESS_SIZE_MAX);
+	}
+
 	if (getenv("NO_COLOR"))
 		return;
 
 	ux_color_stdout = isatty(STDOUT_FILENO);
 	ux_color_stderr = isatty(STDERR_FILENO);
+
+	/* FORCE_COLOR overrides isatty (e.g. GUI subprocess with piped stdout) */
+	if (getenv("FORCE_COLOR")) {
+		ux_color_stdout = true;
+		ux_color_stderr = true;
+	}
 }
 
 #endif

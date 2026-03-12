@@ -1,6 +1,8 @@
 #include "MainFrame.h"
 #include "HomePanel.h"
 #include "OpsPanel.h"
+#include "PartitionPanel.h"
+#include "NVBrowserPanel.h"
 #include "ConsolePanel.h"
 #include "ProcessRunner.h"
 #include "version.h"
@@ -20,10 +22,14 @@ MainFrame::MainFrame()
 
 	m_home = new HomePanel(m_notebook, this);
 	m_ops = new OpsPanel(m_notebook, this);
+	m_partition = new PartitionPanel(m_notebook, this);
+	m_nvBrowser = new NVBrowserPanel(m_notebook, this);
 	m_console = new ConsolePanel(m_notebook, this);
 
 	m_notebook->AddPage(m_home, "Home");
 	m_notebook->AddPage(m_ops, "Operations");
+	m_notebook->AddPage(m_partition, "Partitions");
+	m_notebook->AddPage(m_nvBrowser, "NV Browser");
 	m_notebook->AddPage(m_console, "Console");
 
 	/* Layout */
@@ -88,9 +94,11 @@ void MainFrame::Log(const wxString &msg)
 
 void MainFrame::RunOperation(const wxString &label, const wxArrayString &args)
 {
-	SwitchToTab(2); /* Console tab */
+	SwitchToTab(TAB_CONSOLE);
 	m_console->AppendLine("\n--- " + label + " ---\n");
 	m_ops->SetRunning(true);
+	m_partition->SetRunning(true);
+	m_home->StopAutoRefresh();
 	m_runner->Run(args, m_home->GetWorkingDir());
 }
 
@@ -129,6 +137,7 @@ void MainFrame::OnStartupInit()
 
 	Log("Refreshing device list...");
 	m_home->RefreshDevices();
+	m_home->StartAutoRefresh();
 	Log("Startup complete");
 }
 

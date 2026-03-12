@@ -779,11 +779,13 @@ static void print_usage(FILE *out)
 	fprintf(out, "\n  flash         Flash firmware (same as -F)\n");
 	fprintf(out, "  printgpt      Print GPT/NAND partition tables\n");
 	fprintf(out, "  storageinfo   Query storage hardware information\n");
+	fprintf(out, "  partinfo      Storage info + partition table (single session)\n");
 	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device\n");
 	fprintf(out, "  getslot       Show the active A/B slot\n");
 	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
 	fprintf(out, "  read          Read partition(s) by label\n");
 	fprintf(out, "  readall       Dump all partitions to files\n");
+	fprintf(out, "  write         Erase + write a raw image to a partition\n");
 	fprintf(out, "  erase         Erase partition(s) by label or raw sectors\n");
 	fprintf(out, "  eraseall      Erase all partitions on device\n");
 
@@ -2426,6 +2428,132 @@ static int qdl_storageinfo(int argc, char **argv)
 	} else {
 		ux_err("failed to get storage info\n");
 	}
+
+	firehose_session_close(qdl, true);
+	free(programmer);
+	return !!ret;
+}
+
+static void print_partinfo_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s partinfo [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nQuery storage info and partition table in a single session.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s partinfo\n", __progname);
+	fprintf(out, "  %s partinfo -L /path/to/firmware/\n", __progname);
+}
+
+static int qdl_partinfo(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
+	struct storage_info info;
+	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
+	bool storage_set = false;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			storage_set = true;
+			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+			print_partinfo_help(stdout);
+			return 0;
+		default:
+			print_partinfo_help(stderr);
+			return 1;
+		}
+	}
+
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
+	}
+
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
+		return 1;
+	}
+
+	/* Storage info */
+	ret = firehose_getstorageinfo(qdl, 0, &info);
+	if (ret == 0) {
+		printf("Storage Information:\n");
+		if (info.mem_type[0])
+			printf("  Memory type:    %s\n", info.mem_type);
+		if (info.prod_name[0])
+			printf("  Product name:   %s\n", info.prod_name);
+		if (info.total_blocks)
+			printf("  Total blocks:   %lu\n", info.total_blocks);
+		if (info.block_size)
+			printf("  Block size:     %u\n", info.block_size);
+		if (info.page_size)
+			printf("  Page size:      %u\n", info.page_size);
+		if (info.sector_size)
+			printf("  Sector size:    %u\n", info.sector_size);
+		if (info.num_physical)
+			printf("  Physical parts: %u\n", info.num_physical);
+	} else {
+		ux_warn("failed to get storage info (continuing with partition table)\n");
+		ret = 0; /* Don't fail — still try partition table */
+	}
+
+	printf("\n");
+
+	/* Partition table */
+	if (gpt_print_table(qdl))
+		ret = -1;
 
 	firehose_session_close(qdl, true);
 	free(programmer);
@@ -4543,6 +4671,128 @@ static int qdl_erase(int argc, char **argv)
 	return !!failed;
 }
 
+static void print_write_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s write <label> <file> [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nErase a partition and write a raw image file to it.\n");
+	fprintf(out, "\nArguments:\n");
+	fprintf(out, "  <label>               Partition name (e.g. modem, sbl1, tz)\n");
+	fprintf(out, "  <file>                Image file to write to the partition\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s write modem modem.bin\n", __progname);
+	fprintf(out, "  %s write sbl1 sbl1_new.mbn -L /path/to/firmware/\n", __progname);
+}
+
+static int qdl_write_partition(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
+	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
+	bool storage_set = false;
+	bool use_pcie = false;
+	char *serial = NULL;
+	const char *label;
+	const char *filename;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options,
+				  NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			storage_set = true;
+			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+			print_write_help(stdout);
+			return 0;
+		default:
+			print_write_help(stderr);
+			return 1;
+		}
+	}
+
+	/*
+	 * Positional args: <label> <file> [programmer]
+	 * With -L: <label> <file>
+	 * Without -L: <label> <file> <programmer>
+	 */
+	if (optind >= argc || argc - optind < 2) {
+		fprintf(stderr, "Error: partition label and image file required\n");
+		print_write_help(stderr);
+		return 1;
+	}
+
+	label = argv[optind];
+	filename = argv[optind + 1];
+
+	if (!loader_dir && argc - optind < 3) {
+		/* No -L and no programmer arg — try current dir */
+		loader_dir = ".";
+	}
+
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n",
+				loader_dir);
+			return 1;
+		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
+	}
+
+	ret = firehose_session_open(&qdl,
+				    programmer ? programmer : argv[optind + 2],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
+		return 1;
+	}
+
+	ret = gpt_write_partition(qdl, label, filename);
+
+	firehose_session_close(qdl, true);
+	free(programmer);
+	return !!ret;
+}
+
 static void print_eraseall_help(FILE *out)
 {
 	extern const char *__progname;
@@ -5096,6 +5346,12 @@ static void print_all_help(FILE *out)
 
 	fprintf(out, "\n");
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== partinfo ==========");
+	fprintf(out, "\n");
+	print_partinfo_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "========== reset ==========");
 	fprintf(out, "\n");
 	print_reset_help(out);
@@ -5123,6 +5379,12 @@ static void print_all_help(FILE *out)
 		       "========== readall ==========");
 	fprintf(out, "\n");
 	print_readall_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== write ==========");
+	fprintf(out, "\n");
+	print_write_help(out);
 
 	fprintf(out, "\n");
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
@@ -5443,6 +5705,8 @@ int main(int argc, char **argv)
 		ret = qdl_printgpt(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "storageinfo")) {
 		ret = qdl_storageinfo(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "partinfo")) {
+		ret = qdl_partinfo(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "reset")) {
 		ret = qdl_reset(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "getslot")) {
@@ -5455,6 +5719,8 @@ int main(int argc, char **argv)
 		ret = qdl_readall(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "erase")) {
 		ret = qdl_erase(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "write")) {
+		ret = qdl_write_partition(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "eraseall")) {
 		ret = qdl_eraseall(argc - 1, argv + 1);
 	} else if (!strcmp(argv[1], "nvread")) {

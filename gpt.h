@@ -21,5 +21,7 @@ int gpt_make_xml(struct qdl_device *qdl, const char *outdir,
 		 bool make_read, bool make_program);
 int gpt_erase_partition(struct qdl_device *qdl, const char *label);
 int gpt_erase_all_partitions(struct qdl_device *qdl);
+int gpt_write_partition(struct qdl_device *qdl, const char *label,
+			const char *filename);
 
 #endif

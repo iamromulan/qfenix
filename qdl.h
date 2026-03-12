@@ -130,6 +130,10 @@ int firehose_detect_and_configure(struct qdl_device *qdl,
 				  enum qdl_storage_type storage,
 				  unsigned int timeout_s);
 int firehose_power(struct qdl_device *qdl, const char *mode, int delay);
+int firehose_program_file(struct qdl_device *qdl, unsigned int partition,
+			  unsigned int start_sector, unsigned int max_sectors,
+			  unsigned int sector_size, unsigned int pages_per_block,
+			  const char *label, const char *filename);
 int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 			  unsigned int start_sector, unsigned int num_sectors,
 			  unsigned int sector_size, unsigned int pages_per_block,

@@ -82,6 +82,8 @@ set(GUI_CXX_SRCS
     src/MainFrame.cpp
     src/HomePanel.cpp
     src/OpsPanel.cpp
+    src/PartitionPanel.cpp
+    src/NVBrowserPanel.cpp
     src/ConsolePanel.cpp
     src/ProcessRunner.cpp
 )

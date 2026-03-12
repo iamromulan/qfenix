@@ -65,6 +65,13 @@ public:
 	int RunSudoSync(const wxString &cmd, wxArrayString *output = nullptr,
 			wxArrayString *errors = nullptr);
 
+	/*
+	 * Build a shell command string that runs cmd via sudo with the
+	 * cached password. Suitable for popen() — avoids wxExecute's
+	 * dock icon bounce on macOS.
+	 */
+	wxString BuildSudoCommand(const wxString &cmd);
+
 private:
 	void OnTimer(wxTimerEvent &event);
 	void OnProcessTerminated(wxProcessEvent &event);

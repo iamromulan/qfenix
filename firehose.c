@@ -799,6 +799,40 @@ out:
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
+int firehose_program_file(struct qdl_device *qdl, unsigned int partition,
+			  unsigned int start_sector, unsigned int max_sectors,
+			  unsigned int sector_size, unsigned int pages_per_block,
+			  const char *label, const char *filename)
+{
+	struct program prog = {};
+	char sector_str[16];
+	int fd;
+	int ret;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		ux_err("failed to open %s: %s\n", filename, strerror(errno));
+		return -1;
+	}
+
+	snprintf(sector_str, sizeof(sector_str), "%u", start_sector);
+	prog.partition = partition;
+	prog.start_sector = sector_str;
+	prog.num_sectors = max_sectors;
+	prog.sector_size = sector_size ? sector_size : qdl->sector_size;
+	prog.filename = filename;
+	prog.label = label;
+
+	if (pages_per_block) {
+		prog.is_nand = true;
+		prog.pages_per_block = pages_per_block;
+	}
+
+	ret = firehose_program(qdl, &prog, fd);
+	close(fd);
+	return ret;
+}
+
 static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 			       int fd, void *out_buf, size_t out_len, bool quiet)
 {
@@ -1191,12 +1225,22 @@ int firehose_power(struct qdl_device *qdl, const char *mode, int delay)
 		return -1;
 
 	/*
-	 * For reset/off, the device will reboot and disconnect from USB.
-	 * On macOS, libusb_bulk_transfer() can hang indefinitely when the
-	 * USB device disappears (IOKit backend issue), so skip waiting for
-	 * the ACK — the command was sent, there's nothing useful to read.
+	 * For reset/off, the device will reboot after 'delay' seconds.
+	 * Read the ACK to confirm the device has parsed and accepted the
+	 * command — without this, closing the USB handle immediately can
+	 * tear down the session before the device finishes processing.
+	 *
+	 * The ACK arrives in ~100ms. Use half the delay as the read
+	 * timeout so we finish well before the device disconnects and
+	 * avoid the macOS libusb hang (IOKit doesn't honor timeouts
+	 * for disconnected USB devices).
 	 */
 	if (strcmp(mode, "reset") == 0 || strcmp(mode, "off") == 0) {
+		int ack_timeout = delay > 0 ? (delay * 1000) / 2 : 500;
+
+		if (ack_timeout < 500)
+			ack_timeout = 500;
+		firehose_read(qdl, ack_timeout, firehose_generic_parser, NULL);
 		ux_info("power %s command sent\n", mode);
 		return 0;
 	}

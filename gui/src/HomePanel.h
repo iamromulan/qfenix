@@ -18,18 +18,30 @@ public:
 	wxString GetProgrammer() const;
 	wxString GetStorageType() const;
 
-	/* Refresh device list from qfenix list */
-	void RefreshDevices();
+	/* Refresh device list from qfenix list.
+	 * quiet=true suppresses "Scanning..." status and uses
+	 * wxEXEC_NOEVENTS to prevent dock icon bounce on macOS. */
+	void RefreshDevices(bool quiet = false);
+
+	/* Auto-refresh control (paused during operations) */
+	void StartAutoRefresh();
+	void StopAutoRefresh();
 
 private:
 	void OnRefresh(wxCommandEvent &event);
+	void OnAutoRefreshTimer(wxTimerEvent &event);
+	void OnCountdownTimer(wxTimerEvent &event);
 	void OnBrowseFirmware(wxCommandEvent &event);
 	void OnBrowseWorkDir(wxCommandEvent &event);
 	void OnBrowseProgrammer(wxCommandEvent &event);
 	void ParseDeviceList(const wxString &output);
-	void UpdateDaemonStatus();
+	void UpdateDaemonStatus(bool quiet = false);
 
 	MainFrame *m_frame;
+	wxTimer m_autoRefreshTimer;
+	wxTimer m_countdownTimer;
+	int m_countdownSeconds = 0;
+	wxStaticText *m_countdownLabel;
 
 	/* Device/port controls */
 	wxComboBox *m_diagPort;

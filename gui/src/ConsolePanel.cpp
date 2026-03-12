@@ -78,8 +78,10 @@ wxString ConsolePanel::JSEscape(const char *data, size_t len)
 		case '\t': result += "\\t";  break;
 		case '\0': result += "\\x00"; break;
 		default:
-			if (c < 0x20 && c != '\x1b') {
-				/* Control char (but preserve ESC for ANSI) */
+			if (c < 0x20) {
+				/* Control char — hex-escape for JS string safety.
+				 * ESC (0x1b) becomes \x1b which JS interprets as
+				 * the actual ESC byte for xterm.js ANSI parsing. */
 				result += wxString::Format("\\x%02x", c);
 			} else {
 				result += static_cast<char>(c);

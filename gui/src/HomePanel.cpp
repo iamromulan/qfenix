@@ -3,10 +3,25 @@
 #include "ProcessRunner.h"
 #include <wx/filename.h>
 #include <wx/tokenzr.h>
+#include <stdio.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
+
+enum {
+	ID_AUTO_REFRESH_TIMER = wxID_HIGHEST + 100,
+	ID_COUNTDOWN_TIMER
+};
 
 HomePanel::HomePanel(wxWindow *parent, MainFrame *frame)
-	: wxPanel(parent), m_frame(frame)
+	: wxPanel(parent), m_frame(frame),
+	  m_autoRefreshTimer(this, ID_AUTO_REFRESH_TIMER),
+	  m_countdownTimer(this, ID_COUNTDOWN_TIMER)
 {
+	Bind(wxEVT_TIMER, &HomePanel::OnAutoRefreshTimer, this,
+	     ID_AUTO_REFRESH_TIMER);
+	Bind(wxEVT_TIMER, &HomePanel::OnCountdownTimer, this,
+	     ID_COUNTDOWN_TIMER);
 	auto *mainSizer = new wxBoxSizer(wxVERTICAL);
 
 	/* --- Device / Port Selection --- */
@@ -33,9 +48,15 @@ HomePanel::HomePanel(wxWindow *parent, MainFrame *frame)
 
 	devBox->Add(devGrid, 0, wxEXPAND | wxALL, 8);
 
+	auto *refreshRow = new wxBoxSizer(wxHORIZONTAL);
 	auto *refreshBtn = new wxButton(this, wxID_ANY, "Refresh Devices");
 	refreshBtn->Bind(wxEVT_BUTTON, &HomePanel::OnRefresh, this);
-	devBox->Add(refreshBtn, 0, wxALL, 8);
+	refreshRow->Add(refreshBtn, 0, wxRIGHT, 8);
+
+	m_countdownLabel = new wxStaticText(this, wxID_ANY, "");
+	refreshRow->Add(m_countdownLabel, 0, wxALIGN_CENTER_VERTICAL);
+
+	devBox->Add(refreshRow, 0, wxALL, 8);
 
 	mainSizer->Add(devBox, 0, wxEXPAND | wxALL, 10);
 
@@ -81,7 +102,7 @@ HomePanel::HomePanel(wxWindow *parent, MainFrame *frame)
 		    0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
 
 	wxArrayString storageChoices;
-	storageChoices.Add("auto");
+	storageChoices.Add("nand (default)");
 	storageChoices.Add("emmc");
 	storageChoices.Add("ufs");
 	storageChoices.Add("nand");
@@ -151,22 +172,81 @@ wxString HomePanel::GetStorageType() const
 void HomePanel::OnRefresh(wxCommandEvent &event)
 {
 	RefreshDevices();
+	/* Reset the auto-refresh countdown */
+	if (m_autoRefreshTimer.IsRunning()) {
+		m_autoRefreshTimer.Start(10000); /* restart the 10s interval */
+		m_countdownSeconds = 10;
+	}
 }
 
-void HomePanel::RefreshDevices()
+void HomePanel::StartAutoRefresh()
 {
-	m_statusText->SetLabel("Scanning for devices...");
+	m_countdownSeconds = 10;
+	m_countdownLabel->SetLabel(wxString::Format("Auto-refresh in %ds", m_countdownSeconds));
+	m_autoRefreshTimer.Start(10000); /* 10 seconds */
+	m_countdownTimer.Start(1000);    /* tick every 1 second */
+}
+
+void HomePanel::StopAutoRefresh()
+{
+	m_autoRefreshTimer.Stop();
+	m_countdownTimer.Stop();
+	m_countdownLabel->SetLabel("");
+}
+
+void HomePanel::OnAutoRefreshTimer(wxTimerEvent &event)
+{
+	RefreshDevices(true);
+	m_countdownSeconds = 10;
+}
+
+void HomePanel::OnCountdownTimer(wxTimerEvent &event)
+{
+	if (m_countdownSeconds > 0)
+		m_countdownSeconds--;
+	m_countdownLabel->SetLabel(wxString::Format("Auto-refresh in %ds", m_countdownSeconds));
+}
+
+void HomePanel::RefreshDevices(bool quiet)
+{
+	if (!quiet)
+		m_statusText->SetLabel("Scanning for devices...");
 
 	/*
 	 * qfenix list needs root on macOS to access qcseriald's
 	 * /var/run/ status file and USB devices. Run through sudo.
+	 *
+	 * quiet mode (auto-refresh) uses popen() instead of wxExecute
+	 * to avoid the macOS dock icon bounce that wxExecute triggers
+	 * when forking a subprocess.
 	 */
 	auto *runner = m_frame->GetProcessRunner();
 	wxArrayString output;
 
-	if (runner->IsAuthenticated()) {
+	if (quiet) {
+		/* popen() path — no dock bounce */
+		wxString cmd;
+		if (runner->IsAuthenticated()) {
+			cmd = runner->BuildSudoCommand(
+				ProcessRunner::FindQfenixBinary() + " list");
+		} else {
+			cmd = ProcessRunner::FindQfenixBinary() + " list";
+		}
+		FILE *fp = popen(cmd.utf8_str(), "r");
+		if (fp) {
+			char line[1024];
+			while (fgets(line, sizeof(line), fp)) {
+				wxString s = wxString::FromUTF8(line);
+				s.Trim();
+				if (!s.IsEmpty())
+					output.Add(s);
+			}
+			pclose(fp);
+		}
+	} else if (runner->IsAuthenticated()) {
 		runner->RunSudoSync(
-			ProcessRunner::FindQfenixBinary() + " list", &output);
+			ProcessRunner::FindQfenixBinary() + " list",
+			&output);
 	} else {
 		wxArrayString errors;
 		wxExecute(ProcessRunner::FindQfenixBinary() + " list",
@@ -180,10 +260,10 @@ void HomePanel::RefreshDevices()
 	ParseDeviceList(fullOutput);
 
 	/* Append qcseriald daemon status to the status line */
-	UpdateDaemonStatus();
+	UpdateDaemonStatus(quiet);
 }
 
-void HomePanel::UpdateDaemonStatus()
+void HomePanel::UpdateDaemonStatus(bool quiet)
 {
 #ifdef __APPLE__
 	auto *runner = m_frame->GetProcessRunner();
@@ -195,7 +275,28 @@ void HomePanel::UpdateDaemonStatus()
 	 * /var/run/, so we need root to read it reliably).
 	 */
 	wxArrayString out;
-	int rc = runner->RunSudoSync("cat /var/run/qcseriald.status", &out);
+	int rc;
+
+	if (quiet) {
+		wxString cmd = runner->BuildSudoCommand(
+			"cat /var/run/qcseriald.status");
+		FILE *fp = popen(cmd.utf8_str(), "r");
+		rc = -1;
+		if (fp) {
+			char line[1024];
+			while (fgets(line, sizeof(line), fp)) {
+				wxString s = wxString::FromUTF8(line);
+				s.Trim();
+				if (!s.IsEmpty())
+					out.Add(s);
+			}
+			rc = pclose(fp);
+			rc = WEXITSTATUS(rc);
+		}
+	} else {
+		rc = runner->RunSudoSync(
+			"cat /var/run/qcseriald.status", &out);
+	}
 
 	if (rc != 0) {
 		/* Daemon not running or no status file */

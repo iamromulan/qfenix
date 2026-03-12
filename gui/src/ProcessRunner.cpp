@@ -1,7 +1,9 @@
 #include "ProcessRunner.h"
 #include "MainFrame.h"
 #include "ConsolePanel.h"
+#include "HomePanel.h"
 #include "OpsPanel.h"
+#include "PartitionPanel.h"
 #include <wx/txtstrm.h>
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
@@ -106,6 +108,22 @@ int ProcessRunner::RunSudoSync(const wxString &cmd, wxArrayString *output,
 	if (errors)
 		*errors = err;
 	return static_cast<int>(rc);
+#endif
+}
+
+wxString ProcessRunner::BuildSudoCommand(const wxString &cmd)
+{
+#ifdef __APPLE__
+	if (!m_authenticated)
+		return cmd;
+
+	return wxString::Format(
+		"printf '%%s\\n' %s | sudo -k -S -p '' %s 2>&1",
+		ShellEscapeSQ(m_sudoPassword), cmd);
+#elif defined(__linux__)
+	return "pkexec " + cmd;
+#else
+	return cmd;
 #endif
 }
 
@@ -267,6 +285,17 @@ void ProcessRunner::Run(const wxArrayString &args, const wxString &workDir)
 	argStrs.push_back("pkexec");
 #endif
 
+	/*
+	 * Use env(1) to pass FORCE_COLOR and COLUMNS to the subprocess.
+	 * FORCE_COLOR makes ux.c emit ANSI color codes even though stdout
+	 * is a pipe. COLUMNS gives ux_progress() a width for progress bars.
+	 * env(1) works through sudo/pkexec since it becomes the command
+	 * they execute.
+	 */
+	argStrs.push_back("env");
+	argStrs.push_back("FORCE_COLOR=1");
+	argStrs.push_back("COLUMNS=80");
+
 	argStrs.push_back(std::string(qfenix.utf8_str()));
 	for (const auto &arg : args)
 		argStrs.push_back(std::string(arg.utf8_str()));
@@ -411,6 +440,8 @@ void ProcessRunner::OnProcessTerminated(wxProcessEvent &event)
 	m_process = nullptr;
 	m_pid = 0;
 
-	/* Unlock operations panel */
+	/* Unlock operations and partition panels, resume auto-refresh */
 	m_frame->GetOpsPanel()->SetRunning(false);
+	m_frame->GetPartitionPanel()->SetRunning(false);
+	m_frame->GetHomePanel()->StartAutoRefresh();
 }
