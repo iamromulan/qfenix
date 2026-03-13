@@ -462,6 +462,9 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	size_t buf_len = 0;
 	char tmp[32];
 	bool done = false;
+	bool got_hello = false;
+	bool sent_image_data = false;
+	bool got_eoi = false;
 	int n;
 
 	if (images)
@@ -520,6 +523,13 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 
 		if (buf_len < 8) {
 			ux_err("failed to read sahara request from device\n");
+			if (got_hello && sent_image_data && !got_eoi)
+				ux_err("the programmer was sent but the device "
+				       "stopped responding — this typically "
+				       "means the device has secure boot "
+				       "enabled (fuses blown) and the "
+				       "provided programmer is not signed or "
+				       "not signed with the correct key\n");
 			break;
 		}
 
@@ -538,12 +548,15 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 		switch (pkt->cmd) {
 		case SAHARA_HELLO_CMD:
 			sahara_hello(qdl, pkt);
+			got_hello = true;
 			break;
 		case SAHARA_READ_DATA_CMD:
 			sahara_read(qdl, pkt, images);
+			sent_image_data = true;
 			break;
 		case SAHARA_END_OF_IMAGE_CMD:
 			sahara_eoi(qdl, pkt);
+			got_eoi = true;
 			break;
 		case SAHARA_DONE_RESP_CMD:
 			done = sahara_done(qdl, pkt);
@@ -557,6 +570,7 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			break;
 		case SAHARA_READ_DATA64_CMD:
 			sahara_read64(qdl, pkt, images);
+			sent_image_data = true;
 			break;
 		case SAHARA_RESET_RESP_CMD:
 			assert(pkt->length == SAHARA_RESET_LENGTH);
