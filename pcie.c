@@ -192,6 +192,22 @@ static int pcie_upload_programmer(int port_index, const char *programmer_path)
 		 info->bhi_ee, info->bhi_sernum,
 		 info->bhi_ver_major, info->bhi_ver_minor);
 
+	/*
+	 * If the firehose loader is already resident (MHI_EE_FP, ee=7), the
+	 * device is in flashing-protocol mode and ready to accept firehose
+	 * commands on /dev/mhi_EDL. Skip the re-upload and return success so
+	 * the caller can open /dev/mhi_EDL directly. Without this, every
+	 * post-printgpt invocation (e.g. `qfenix readall -P` after a
+	 * truncated `qfenix printgpt -P`) bails with
+	 * "device not in EDL mode (ee=7, expected 6)" even though the loader
+	 * is alive — forcing a full EDL re-entry round-trip per qfenix call.
+	 */
+	if (info->bhi_ee == MHI_EE_FP) {
+		ux_info("loader already running (ee=FP), skipping re-upload\n");
+		rc = 0;
+		goto out;
+	}
+
 	if (info->bhi_ee != MHI_EE_EDL) {
 		ux_err("device not in EDL mode (ee=%u, expected %u)\n",
 		       info->bhi_ee, MHI_EE_EDL);
