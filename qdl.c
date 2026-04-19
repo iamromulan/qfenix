@@ -850,6 +850,9 @@ static void print_usage(FILE *out)
 		       "\nGlobal Options");
 	fprintf(out, " (work with all subcommands):\n");
 	fprintf(out, "      --log=FILE            Write debug-level log to FILE\n");
+	fprintf(out, "      --usb-id=VID:PID      Treat VID:PID as an EDL endpoint (hex,\n");
+	fprintf(out, "                            repeatable). Extends built-in allowlist\n");
+	fprintf(out, "                            for OEM boot modes (e.g. 1199:9090).\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nFlash Options");
@@ -5674,6 +5677,62 @@ int main(int argc, char **argv)
 			argc -= strip;
 			break;
 		}
+	}
+
+	/*
+	 * Pre-scan for ``--usb-id VID:PID`` (global, repeatable). Extends the
+	 * built-in EDL device allowlist at runtime so qfenix will recognize
+	 * one-off OEM boot modes whose PID isn't in usb_ids.h yet — e.g.
+	 * Sierra EM7511 1199:9090 AirPrime Boot — without a recompile or a
+	 * patch. Accepts 1-4 hex digits per side, with or without ``0x``
+	 * prefix. Repeat the flag to add multiple pairs. Stripped from argv
+	 * so per-subcommand getopt tables don't need to know about it.
+	 */
+	for (int i = 1; i < argc; ) {
+		const char *spec = NULL;
+		int strip = 0;
+
+		if (!strncmp(argv[i], "--usb-id=", 9)) {
+			spec = argv[i] + 9;
+			strip = 1;
+		} else if (!strcmp(argv[i], "--usb-id") && i + 1 < argc) {
+			spec = argv[i + 1];
+			strip = 2;
+		} else {
+			i++;
+			continue;
+		}
+
+		unsigned int vid_u = 0, pid_u = 0;
+		int consumed = 0;
+		if (sscanf(spec, "%x:%x%n", &vid_u, &pid_u, &consumed) != 2 ||
+		    spec[consumed] != '\0' ||
+		    vid_u > 0xffff || pid_u > 0xffff) {
+			fprintf(stderr,
+				"Error: --usb-id expects VID:PID in hex (e.g. 1199:9090), got '%s'\n",
+				spec);
+			return 1;
+		}
+
+		if (usb_add_extra_edl_id((uint16_t)vid_u, (uint16_t)pid_u) < 0) {
+			/* Table is full. Silently dropping the request would
+			 * let the subcommand run with an EDL allowlist that
+			 * doesn't match what the operator asked for — which
+			 * then fails inside usb_open() with the generic
+			 * "Waiting for EDL device..." spin and looks like a
+			 * different bug. Fail the process instead so the CLI
+			 * error is unambiguous. */
+			fprintf(stderr,
+				"Error: --usb-id runtime allowlist is full; cannot register %04x:%04x\n",
+				vid_u, pid_u);
+			return 1;
+		}
+
+		/* Strip --usb-id arg(s) so subcommands don't see them. */
+		for (int j = i; j + strip < argc; j++)
+			argv[j] = argv[j + strip];
+		argc -= strip;
+		/* Don't advance i — the next arg just shifted into this slot. */
 	}
 
 	/* Handle no args, --help, --help-all, -h before subcommand dispatch */

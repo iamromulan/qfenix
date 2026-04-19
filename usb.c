@@ -39,31 +39,185 @@ struct qdl_device_usb {
 #define LIBUSB_ENDPOINT_TRANSFER_TYPE_BULK LIBUSB_TRANSFER_TYPE_BULK
 #endif
 
+/*
+ * Runtime-extendable EDL-mode device allowlist.
+ *
+ * The built-in list in usb_ids.h covers well-known Qualcomm / Sony / Sierra
+ * / etc. EDL PIDs. Callers (typically main() in qdl.c) can extend it at
+ * runtime via usb_add_extra_edl_id() to cover:
+ *
+ *   - One-off OEM variants whose PID isn't in the built-in list yet.
+ *   - OEM boot modes that speak Sahara but aren't publicly documented.
+ *   - Ad-hoc debugging against an unknown PID without a recompile.
+ *
+ * Kept as file-scope state in usb.c (not usb_ids.h) because usb_ids.h is a
+ * "static inline" header consumed by many translation units — a runtime
+ * mutable array in a static-inline header would silently diverge per TU.
+ */
+#define USB_EXTRA_EDL_MAX 16
+
+static struct {
+	uint16_t vid;
+	uint16_t pid;
+} usb_extra_edl_ids[USB_EXTRA_EDL_MAX];
+static unsigned int usb_extra_edl_count;
+
+/*
+ * Register an additional VID:PID pair as an EDL-mode endpoint for the
+ * current qfenix process. Returns 0 on success, -1 if the table is full.
+ * Duplicates (either against the built-in list or an existing extra) are
+ * silently ignored.
+ */
+int usb_add_extra_edl_id(uint16_t vid, uint16_t pid)
+{
+	unsigned int i;
+
+	if (is_edl_device(vid, pid))
+		return 0;
+
+	for (i = 0; i < usb_extra_edl_count; i++) {
+		if (usb_extra_edl_ids[i].vid == vid &&
+		    usb_extra_edl_ids[i].pid == pid)
+			return 0;
+	}
+
+	if (usb_extra_edl_count >= USB_EXTRA_EDL_MAX) {
+		warnx("usb: --usb-id table full (max %d), ignoring %04x:%04x",
+		      USB_EXTRA_EDL_MAX, vid, pid);
+		return -1;
+	}
+
+	usb_extra_edl_ids[usb_extra_edl_count].vid = vid;
+	usb_extra_edl_ids[usb_extra_edl_count].pid = pid;
+	usb_extra_edl_count++;
+	return 0;
+}
+
+static bool usb_is_edl_device_runtime(uint16_t vid, uint16_t pid)
+{
+	unsigned int i;
+
+	if (is_edl_device(vid, pid))
+		return true;
+
+	for (i = 0; i < usb_extra_edl_count; i++) {
+		if (usb_extra_edl_ids[i].vid == vid &&
+		    usb_extra_edl_ids[i].pid == pid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Extract a serial-number-like string from a device's USB descriptors.
+ *
+ * Qualcomm's "Gobi" reference composition advertises a serial embedded in
+ * iProduct as ``<name>_SN:<serial>`` — e.g. ``QUSB__BULK_SN:1234abcd``. This
+ * has historically been the only signal qfenix consulted, which works fine
+ * for Qualcomm-branded EDL devices but BREAKS for OEM boot modes that
+ * populate iSerialNumber instead of stuffing the serial into iProduct.
+ *
+ * Concrete case that motivated this: Sierra Wireless EM7511 in
+ * 1199:9090 AirPrime Boot mode. Its iProduct is ``Sierra Wireless EM7511
+ * Qualcomm® Snapdragon™ X16 LTE-A`` (no ``_SN:``) but iSerialNumber is
+ * ``YT94979507031546`` — a perfectly usable FSN. Previously qfenix rejected
+ * the device with "ignoring device with no serial number".
+ *
+ * Fallback order:
+ *   1. iProduct descriptor, after ``_SN:`` marker (Qualcomm-style embedding).
+ *   2. iSerialNumber descriptor verbatim (OEM-style serial).
+ *
+ * Returns 1 on success (serial written to out, null-terminated, truncated
+ * to out_sz-1) or 0 if neither source yielded a serial.
+ */
+static int usb_read_device_serial(struct libusb_device_handle *handle,
+				  const struct libusb_device_descriptor *desc,
+				  char *out, size_t out_sz)
+{
+	unsigned char buf[128];
+	const char *src = NULL;
+	size_t src_len = 0;
+	int ret;
+
+	if (!out || out_sz == 0)
+		return 0;
+
+	/* 1. Try iProduct ``_SN:`` embedding first — preserves prior behavior
+	 *    for Qualcomm-branded EDL devices that already worked. */
+	if (desc->iProduct) {
+		ret = libusb_get_string_descriptor_ascii(handle, desc->iProduct,
+							 buf, sizeof(buf) - 1);
+		if (ret < 0) {
+			/* Preserve the pre-refactor diagnostic: the old code
+			 * logged libusb_strerror(ret) and aborted this device.
+			 * We log and fall through so the iSerialNumber branch
+			 * still gets a chance — a failed iProduct read doesn't
+			 * preclude iSerialNumber from succeeding. */
+			warnx("failed to read iProduct descriptor (idVendor=%04x idProduct=%04x): %s",
+			      desc->idVendor, desc->idProduct,
+			      libusb_strerror(ret));
+		} else {
+			buf[ret] = '\0';
+			char *p = strstr((char *)buf, "_SN:");
+			if (p) {
+				p += strlen("_SN:");
+				src = p;
+				src_len = strcspn(p, " _");
+			}
+		}
+	}
+
+	/* 2. Fallback: iSerialNumber descriptor.
+	 *    Trigger when step 1 didn't match OR matched but produced an
+	 *    empty serial (iProduct contained ``_SN:`` followed immediately
+	 *    by EOL/space/underscore). The empty-match case is rare but
+	 *    exercised by malformed iProduct strings in the wild. */
+	if ((!src || src_len == 0) && desc->iSerialNumber) {
+		ret = libusb_get_string_descriptor_ascii(handle, desc->iSerialNumber,
+							 buf, sizeof(buf) - 1);
+		if (ret < 0) {
+			warnx("failed to read iSerialNumber descriptor (idVendor=%04x idProduct=%04x): %s",
+			      desc->idVendor, desc->idProduct,
+			      libusb_strerror(ret));
+		} else if (ret > 0) {
+			buf[ret] = '\0';
+			/* Trim trailing whitespace. */
+			while (ret > 0 && (buf[ret - 1] == ' ' ||
+					   buf[ret - 1] == '\t' ||
+					   buf[ret - 1] == '\r' ||
+					   buf[ret - 1] == '\n'))
+				buf[--ret] = '\0';
+			if (ret > 0) {
+				src = (const char *)buf;
+				src_len = (size_t)ret;
+			}
+		}
+	}
+
+	if (!src || src_len == 0)
+		return 0;
+
+	if (src_len >= out_sz)
+		src_len = out_sz - 1;
+
+	memcpy(out, src, src_len);
+	out[src_len] = '\0';
+	return 1;
+}
+
 static bool usb_match_usb_serial(struct libusb_device_handle *handle, const char *serial,
 				 const struct libusb_device_descriptor *desc)
 {
 	char buf[128];
-	char *p;
-	int ret;
 
 	/* If no serial is requested, consider everything a match */
 	if (!serial)
 		return true;
 
-	ret = libusb_get_string_descriptor_ascii(handle, desc->iProduct, (unsigned char *)buf, sizeof(buf));
-	if (ret < 0) {
-		warnx("failed to read iProduct descriptor: %s", libusb_strerror(ret));
-		return false;
-	}
-
-	p = strstr(buf, "_SN:");
-	if (!p)
+	if (!usb_read_device_serial(handle, desc, buf, sizeof(buf)))
 		return false;
 
-	p += strlen("_SN:");
-	p[strcspn(p, " _")] = '\0';
-
-	return strcmp(p, serial) == 0;
+	return strcmp(buf, serial) == 0;
 }
 
 static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const char *serial)
@@ -88,8 +242,9 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		return -1;
 	}
 
-	/* Consider only known EDL-mode devices */
-	if (!is_edl_device(desc.idVendor, desc.idProduct))
+	/* Consider only known EDL-mode devices (built-in list + any
+	 * entries added at runtime via --usb-id). */
+	if (!usb_is_edl_device_runtime(desc.idVendor, desc.idProduct))
 		return 0;
 
 	ret = libusb_get_active_config_descriptor(dev, &config);
@@ -291,11 +446,8 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 	struct qdl_device_desc *result;
 	struct libusb_device **devices;
 	struct libusb_device *dev;
-	unsigned long serial_len;
-	unsigned char buf[128];
 	ssize_t device_count;
 	unsigned int count = 0;
-	char *serial;
 	int ret;
 	int i;
 
@@ -325,7 +477,7 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 			continue;
 		}
 
-		if (!is_edl_device(desc.idVendor, desc.idProduct))
+		if (!usb_is_edl_device_runtime(desc.idVendor, desc.idProduct))
 			continue;
 
 		ret = libusb_open(dev, &handle);
@@ -335,31 +487,20 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 			continue;
 		}
 
-		ret = libusb_get_string_descriptor_ascii(handle, desc.iProduct, buf, sizeof(buf) - 1);
-		if (ret < 0) {
-			warnx("failed to read iProduct descriptor: %s", libusb_strerror(ret));
-			libusb_close(handle);
-			continue;
+		if (!usb_read_device_serial(handle, &desc,
+					    result[count].serial,
+					    sizeof(result[count].serial))) {
+			/*
+			 * Neither iProduct ``_SN:`` nor iSerialNumber yielded
+			 * a usable serial. Keep the device listed but record
+			 * an empty serial — the caller can still target it by
+			 * VID:PID when only one such device is present on the
+			 * host. Serial-based selection (-S) won't match.
+			 */
+			ux_warn("device %04x:%04x has no usable serial descriptor; listing with empty serial\n",
+				desc.idVendor, desc.idProduct);
+			result[count].serial[0] = '\0';
 		}
-		buf[ret] = '\0';
-
-		serial = strstr((char *)buf, "_SN:");
-		if (!serial) {
-			ux_err("ignoring device with no serial number\n");
-			libusb_close(handle);
-			continue;
-		}
-
-		serial += strlen("_SN:");
-		serial_len = strcspn(serial, " _");
-		if (serial_len + 1 > sizeof(result[count].serial)) {
-			ux_err("ignoring device with unexpectedly long serial number\n");
-			libusb_close(handle);
-			continue;
-		}
-
-		memcpy(result[count].serial, serial, serial_len);
-		result[count].serial[serial_len] = '\0';
 
 		result[count].vid = desc.idVendor;
 		result[count].pid = desc.idProduct;
@@ -416,8 +557,10 @@ struct usb_adb_desc *usb_list_adb(unsigned int *devices_found)
 		if (!is_diag_vendor(desc.idVendor))
 			continue;
 
-		/* Skip EDL devices */
-		if (is_edl_device(desc.idVendor, desc.idProduct))
+		/* Skip EDL devices (including runtime --usb-id extras — we
+		 * want the DIAG list to exclude anything we've explicitly
+		 * tagged as an EDL endpoint). */
+		if (usb_is_edl_device_runtime(desc.idVendor, desc.idProduct))
 			continue;
 
 		ret = libusb_get_active_config_descriptor(devices[i],

@@ -10,6 +10,7 @@
 #endif
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "list.h"
 #include "patch.h"
@@ -110,6 +111,14 @@ struct qdl_device_desc {
 };
 
 struct qdl_device_desc *usb_list(unsigned int *devices_found);
+
+/*
+ * Register an additional VID:PID pair as an EDL-mode endpoint at runtime
+ * (in addition to the built-in list in usb_ids.h). Typically wired up
+ * from the top-level ``--usb-id`` CLI option in qdl.c's main(). Returns 0
+ * on success, -1 if the internal table is full.
+ */
+int usb_add_extra_edl_id(uint16_t vid, uint16_t pid);
 
 struct usb_adb_desc {
 	int vid;
