@@ -469,6 +469,71 @@ int pcie_has_device(void)
 	return pcie_find_port() >= 0;
 }
 
+/*
+ * Enumerate every PCIe-MHI modem visible on this host and print a
+ * one-line description per device to `out`. Unlike pcie_find_port()
+ * which short-circuits on the first hit, this walks the full OOT
+ * pcie_mhi.ko port index range (0..MHI_MAX_PORTS-1) and the in-tree
+ * mhi_wwan_ctrl instance range (wwan0..wwan9) so multi-modem hosts
+ * see every attached device. Returns the device count for caller's
+ * "found anything" decision.
+ */
+int list_pcie_devices(FILE *out)
+{
+	char path[64];
+	int count = 0;
+	int i;
+
+	/* OOT pcie_mhi.ko BHI chardevs — full firehose-capable */
+	for (i = 0; i < MHI_MAX_PORTS; i++) {
+		if (i == 0)
+			snprintf(path, sizeof(path), "/dev/mhi_BHI");
+		else
+			snprintf(path, sizeof(path), "/dev/mhi_BHI%d", i);
+
+		if (access(path, F_OK) == 0) {
+			fprintf(out, "PCIe MHI modem at %s (OOT pcie_mhi.ko, full EDL)\n",
+				path);
+			count++;
+		}
+	}
+
+	/*
+	 * OOT pcie_mhi.ko DIAG-only — modems where qfenix found a DIAG
+	 * chardev but no corresponding BHI sibling. Rare in practice
+	 * (the OOT driver normally creates both) but worth surfacing.
+	 */
+	for (i = 0; i < MHI_MAX_PORTS; i++) {
+		char bhi[64];
+		if (i == 0) {
+			snprintf(path, sizeof(path), "/dev/mhi_DIAG");
+			snprintf(bhi, sizeof(bhi), "/dev/mhi_BHI");
+		} else {
+			snprintf(path, sizeof(path), "/dev/mhi_DIAG%d", i);
+			snprintf(bhi, sizeof(bhi), "/dev/mhi_BHI%d", i);
+		}
+
+		if (access(path, F_OK) == 0 && access(bhi, F_OK) != 0) {
+			fprintf(out, "PCIe MHI modem at %s (OOT pcie_mhi.ko, DIAG only)\n",
+				path);
+			count++;
+		}
+	}
+
+	/* In-tree mhi_pci_generic + mhi_wwan_ctrl — DIAG only */
+	for (i = 0; i < PCIE_WWAN_MAX_INSTANCES; i++) {
+		snprintf(path, sizeof(path), "/dev/wwan%dqcdm0", i);
+
+		if (access(path, F_OK) == 0) {
+			fprintf(out, "PCIe MHI modem at %s (in-tree mhi_wwan_ctrl, DIAG only)\n",
+				path);
+			count++;
+		}
+	}
+
+	return count;
+}
+
 struct qdl_device *pcie_init(void)
 {
 	struct qdl_device_pcie *pcie;

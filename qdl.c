@@ -33,6 +33,7 @@
 #include "version.h"
 #include "atcmd.h"
 #include "at_port.h"
+#include "pcie.h"
 
 #ifdef HAVE_QCSERIALD
 #include "qcseriald.h"
@@ -1711,6 +1712,15 @@ static int qdl_list(FILE *out)
 	if (n > 0 && prev > 0)
 		fprintf(out, "\n");
 	found += n;
+
+#ifdef __linux__
+	/* PCIe-MHI devices (Linux only — Windows uses list_com_ports above) */
+	prev = found;
+	n = list_pcie_devices(out);
+	if (n > 0 && prev > 0)
+		fprintf(out, "\n");
+	found += n;
+#endif
 
 	if (!found)
 		fprintf(out, "No devices found\n");
