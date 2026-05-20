@@ -3,7 +3,17 @@
  * PCIe/MHI transport for Qualcomm modems.
  *
  * Supports programming PCIe-connected Qualcomm modems that expose
- * MHI character devices (/dev/mhi_DIAG, /dev/mhi_BHI, /dev/mhi_EDL).
+ * MHI character devices (/dev/mhi_DIAG, /dev/mhi_BHI, /dev/mhi_EDL)
+ * via the Quectel out-of-tree pcie_mhi.ko driver.
+ *
+ * Also supports detecting DIAG-only access via Linux's in-tree
+ * mhi_pci_generic + mhi_wwan_ctrl drivers, which expose the DIAG
+ * channel as /dev/wwanNqcdm0 under the kernel WWAN subsystem. This
+ * is sufficient for DIAG-only operations (diag2edl, nvread, nvwrite,
+ * efsbackup) but NOT for firehose programmer upload — the in-tree
+ * driver does not expose the BHI register interface as a chardev,
+ * so printgpt/readall/flash still require the OOT pcie_mhi.ko driver
+ * (or a kernel patch exposing BHI).
  *
  * Flow: DIAG→EDL switch → BHI programmer upload → EDL firehose I/O
  */
@@ -28,15 +38,39 @@
 /* DIAG command to switch Qualcomm devices to EDL mode */
 static const unsigned char edl_cmd[] = {0x4b, 0x65, 0x01, 0x00, 0x54, 0x0f, 0x7e};
 
+/*
+ * Port-index encoding: indices 0..MHI_MAX_PORTS-1 refer to OOT pcie_mhi.ko
+ * chardevs (/dev/mhi_*); indices PCIE_WWAN_INDEX_BASE..+WWAN_MAX_INSTANCES-1
+ * refer to in-tree mhi_wwan_ctrl chardevs (/dev/wwanN*). Callers treat the
+ * return value of pcie_find_port() as opaque and pass it to pcie_port_path()
+ * to materialize a concrete chardev path.
+ */
+#define PCIE_WWAN_INDEX_BASE 100
+#define PCIE_WWAN_MAX_INSTANCES 10
+
+static inline bool pcie_index_is_wwan(int index)
+{
+	return index >= PCIE_WWAN_INDEX_BASE &&
+	       index < PCIE_WWAN_INDEX_BASE + PCIE_WWAN_MAX_INSTANCES;
+}
+
 struct qdl_device_pcie {
 	struct qdl_device base;
 	int edl_fd;		/* /dev/mhi_EDL fd for firehose I/O */
-	int port_index;		/* MHI port instance (0-9) */
+	int port_index;		/* MHI port instance (0-9) or wwan-style (100+) */
 };
 
 /*
- * Try to detect which MHI port index has a modem present.
- * Returns the index (0-9) or -1 if not found.
+ * Try to detect which MHI port has a modem present.
+ *
+ * Probe order:
+ *   1. OOT pcie_mhi.ko BHI chardev (/dev/mhi_BHI[N]) — full EDL flow
+ *   2. OOT pcie_mhi.ko DIAG chardev (/dev/mhi_DIAG[N]) — DIAG-only ops
+ *   3. In-tree mhi_wwan_ctrl QCDM chardev (/dev/wwanNqcdm0) — DIAG-only ops
+ *
+ * Returns the index, where indices 0..MHI_MAX_PORTS-1 are OOT-style and
+ * PCIE_WWAN_INDEX_BASE+N is in-tree-style with wwan instance N. Returns
+ * -1 if no PCIe-MHI modem is detectable.
  */
 static int pcie_find_port(void)
 {
@@ -64,11 +98,51 @@ static int pcie_find_port(void)
 			return i;
 	}
 
+	/*
+	 * In-tree fallback: Linux's mhi_pci_generic + mhi_wwan_ctrl drivers
+	 * expose the DIAG channel as /dev/wwanNqcdm0 under the kernel WWAN
+	 * subsystem (instead of /dev/mhi_DIAG[N] as the OOT pcie_mhi.ko
+	 * driver does). The DIAG channel is sufficient for diag2edl /
+	 * nvread / nvwrite / efsbackup. Note that the in-tree driver does
+	 * NOT expose the BHI register interface as a chardev, so firehose
+	 * programmer upload (printgpt, readall, flash) is still blocked
+	 * on that path — see pcie_upload_programmer() for the explicit
+	 * error message in that case.
+	 */
+	for (i = 0; i < PCIE_WWAN_MAX_INSTANCES; i++) {
+		snprintf(path, sizeof(path), "/dev/wwan%dqcdm0", i);
+
+		if (access(path, F_OK) == 0)
+			return PCIE_WWAN_INDEX_BASE + i;
+	}
+
 	return -1;
 }
 
 static void pcie_port_path(char *buf, size_t size, const char *type, int index)
 {
+	if (pcie_index_is_wwan(index)) {
+		int wwan_instance = index - PCIE_WWAN_INDEX_BASE;
+
+		/*
+		 * Map MHI channel-type names to in-tree kernel WWAN
+		 * subsystem chardev names. Only DIAG (qcdm0) has a real
+		 * exposure here; BHI and EDL chardevs do not exist under
+		 * the in-tree driver, so the paths emitted below will
+		 * fail to open with ENOENT and the caller will report a
+		 * clear error.
+		 */
+		if (strcmp(type, "DIAG") == 0)
+			snprintf(buf, size, "/dev/wwan%dqcdm0", wwan_instance);
+		else if (strcmp(type, "BHI") == 0)
+			snprintf(buf, size, "/dev/wwan%dbhi0", wwan_instance);
+		else if (strcmp(type, "EDL") == 0)
+			snprintf(buf, size, "/dev/wwan%dedl0", wwan_instance);
+		else
+			snprintf(buf, size, "/dev/wwan%d_%s", wwan_instance, type);
+		return;
+	}
+
 	if (index == 0)
 		snprintf(buf, size, "/dev/mhi_%s", type);
 	else
@@ -132,6 +206,26 @@ static int pcie_upload_programmer(int port_index, const char *programmer_path)
 	long ret;
 	int bhifd = -1;
 	int rc = -1;
+
+	/*
+	 * Firehose programmer upload requires the BHI register interface,
+	 * which Linux's in-tree mhi_pci_generic + mhi_wwan_ctrl drivers do
+	 * not expose as a chardev. If the modem was discovered via the
+	 * in-tree WWAN subsystem fallback, fail early with an explanation
+	 * rather than letting open() emit a confusing ENOENT on a
+	 * /dev/wwanNbhi0 path that has never existed.
+	 */
+	if (pcie_index_is_wwan(port_index)) {
+		ux_err("firehose programmer upload requires /dev/mhi_BHI, "
+		       "which Linux's in-tree mhi_pci_generic + "
+		       "mhi_wwan_ctrl drivers do not expose. Load the "
+		       "Quectel out-of-tree pcie_mhi.ko driver (or apply "
+		       "a kernel patch exposing BHI as a chardev) to use "
+		       "this command. DIAG-only commands (diag2edl, "
+		       "nvread, nvwrite, efsbackup) work without "
+		       "pcie_mhi.ko.\n");
+		return -1;
+	}
 
 	pcie_port_path(bhi_path, sizeof(bhi_path), "BHI", port_index);
 
