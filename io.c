@@ -14,9 +14,6 @@ struct qdl_device *qdl_init(enum QDL_DEVICE_TYPE type)
 	if (type == QDL_DEVICE_SIM)
 		return sim_init();
 
-	if (type == QDL_DEVICE_PCIE)
-		return pcie_init();
-
 	return NULL;
 }
 

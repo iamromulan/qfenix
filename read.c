@@ -19,52 +19,14 @@
 
 static struct list_head read_ops = LIST_INIT(read_ops);
 
-int read_op_load_tag(xmlNode *node, const char *incdir)
-{
-	struct read_op *read_op;
-	char tmp[PATH_MAX];
-	int errors = 0;
-
-	read_op = calloc(1, sizeof(struct read_op));
-
-	read_op->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
-	read_op->filename = attr_as_string(node, "filename", &errors);
-	read_op->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
-	read_op->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
-	read_op->start_sector = attr_as_string(node, "start_sector", &errors);
-
-	/* PAGES_PER_BLOCK is optional (only present on NAND) */
-	{
-		xmlChar *ppb = xmlGetProp(node, (xmlChar *)"PAGES_PER_BLOCK");
-		if (ppb) {
-			read_op->pages_per_block = attr_as_unsigned(node, "PAGES_PER_BLOCK", &errors);
-			xmlFree(ppb);
-		}
-	}
-
-	if (errors) {
-		free(read_op);
-		return -EINVAL;
-	}
-
-	normalize_path((char *)read_op->filename);
-
-	if (incdir) {
-		snprintf(tmp, PATH_MAX, "%s/%s", incdir, read_op->filename);
-		read_op->filename = strdup(tmp);
-	}
-
-	list_add(&read_ops, &read_op->node);
-	firehose_op_add_read(read_op);
-
-	return 0;
-}
-
 int read_op_load(const char *read_op_file, const char *incdir)
 {
+	struct read_op *read_op;
 	xmlNode *node;
 	xmlNode *root;
 	xmlDoc *doc;
+	int errors;
+	char tmp[PATH_MAX];
 
 	doc = xmlReadFile(read_op_file, NULL, 0);
 	if (!doc) {
@@ -77,11 +39,35 @@ int read_op_load(const char *read_op_file, const char *incdir)
 		if (node->type != XML_ELEMENT_NODE)
 			continue;
 
-		if (xmlStrcmp(node->name, (xmlChar *)"read"))
+		if (xmlStrcmp(node->name, (xmlChar *)"read")) {
+			ux_err("unrecognized tag \"%s\" in read-type file \"%s\", ignoring\n",
+			       node->name, read_op_file);
 			continue;
+		}
 
-		if (read_op_load_tag(node, incdir) < 0)
-			ux_err("errors while parsing read tag in \"%s\"\n", read_op_file);
+		errors = 0;
+
+		read_op = calloc(1, sizeof(struct read_op));
+
+		read_op->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
+		read_op->filename = attr_as_string(node, "filename", &errors);
+		read_op->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
+		read_op->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
+		read_op->start_sector = attr_as_string(node, "start_sector", &errors);
+
+		if (errors) {
+			ux_err("errors while parsing read-type file \"%s\"\n", read_op_file);
+			free(read_op);
+			continue;
+		}
+
+		if (incdir) {
+			snprintf(tmp, PATH_MAX, "%s/%s", incdir, read_op->filename);
+			if (access(tmp, F_OK) != -1)
+				read_op->filename = strdup(tmp);
+		}
+
+		list_add(&read_ops, &read_op->node);
 	}
 
 	xmlFreeDoc(doc);
@@ -96,7 +82,6 @@ int read_op_execute(struct qdl_device *qdl, int (*apply)(struct qdl_device *qdl,
 	int fd;
 
 	list_for_each_entry(read_op, &read_ops, node) {
-		mkpath(read_op->filename);
 		fd = open(read_op->filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 		if (fd < 0) {
 			ux_info("unable to open %s...\n", read_op->filename);
@@ -143,7 +128,6 @@ int read_cmd_add(const char *address, const char *filename)
 	read_op->gpt_partition = gpt_partition;
 
 	list_add(&read_ops, &read_op->node);
-	firehose_op_add_read(read_op);
 
 	return 0;
 }

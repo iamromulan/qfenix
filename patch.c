@@ -16,40 +16,13 @@
 static struct list_head patches = LIST_INIT(patches);
 static bool patches_loaded;
 
-int patch_load_tag(xmlNode *node)
-{
-	struct patch *patch;
-	int errors = 0;
-
-	patch = calloc(1, sizeof(struct patch));
-
-	patch->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
-	patch->byte_offset = attr_as_unsigned(node, "byte_offset", &errors);
-	patch->filename = attr_as_string(node, "filename", &errors);
-	patch->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
-	patch->size_in_bytes = attr_as_unsigned(node, "size_in_bytes", &errors);
-	patch->start_sector = attr_as_string(node, "start_sector", &errors);
-	patch->value = attr_as_string(node, "value", &errors);
-	patch->what = attr_as_string(node, "what", &errors);
-
-	if (errors) {
-		free(patch);
-		return -EINVAL;
-	}
-
-	normalize_path((char *)patch->filename);
-
-	list_add(&patches, &patch->node);
-	firehose_op_add_patch(patch);
-
-	return 0;
-}
-
 int patch_load(const char *patch_file)
 {
+	struct patch *patch;
 	xmlNode *node;
 	xmlNode *root;
 	xmlDoc *doc;
+	int errors;
 
 	doc = xmlReadFile(patch_file, NULL, 0);
 	if (!doc) {
@@ -62,11 +35,31 @@ int patch_load(const char *patch_file)
 		if (node->type != XML_ELEMENT_NODE)
 			continue;
 
-		if (xmlStrcmp(node->name, (xmlChar *)"patch"))
+		if (xmlStrcmp(node->name, (xmlChar *)"patch")) {
+			ux_err("unrecognized tag \"%s\" in patch-type file, ignoring\n", node->name);
 			continue;
+		}
 
-		if (patch_load_tag(node) < 0)
-			ux_err("errors while parsing patch tag in \"%s\"\n", patch_file);
+		errors = 0;
+
+		patch = calloc(1, sizeof(struct patch));
+
+		patch->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
+		patch->byte_offset = attr_as_unsigned(node, "byte_offset", &errors);
+		patch->filename = attr_as_string(node, "filename", &errors);
+		patch->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
+		patch->size_in_bytes = attr_as_unsigned(node, "size_in_bytes", &errors);
+		patch->start_sector = attr_as_string(node, "start_sector", &errors);
+		patch->value = attr_as_string(node, "value", &errors);
+		patch->what = attr_as_string(node, "what", &errors);
+
+		if (errors) {
+			ux_err("errors while parsing patch-type file \"%s\"\n", patch_file);
+			free(patch);
+			continue;
+		}
+
+		list_add(&patches, &patch->node);
 	}
 
 	xmlFreeDoc(doc);

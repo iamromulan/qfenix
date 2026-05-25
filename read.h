@@ -3,7 +3,6 @@
 #define __READ_H__
 
 #include <stdbool.h>
-#include <libxml/tree.h>
 
 #include "list.h"
 
@@ -11,7 +10,6 @@ struct qdl_device;
 
 struct read_op {
 	unsigned int sector_size;
-	unsigned int pages_per_block;
 	const char *filename;
 	int partition;
 	unsigned int num_sectors;
@@ -21,7 +19,6 @@ struct read_op {
 	struct list_head node;
 };
 
-int read_op_load_tag(xmlNode *node, const char *incdir);
 int read_op_load(const char *read_op_file, const char *incdir);
 int read_op_execute(struct qdl_device *qdl,
 		    int (*apply)(struct qdl_device *qdl, struct read_op *read_op, int fd));

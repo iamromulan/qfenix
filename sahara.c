@@ -383,26 +383,13 @@ static void sahara_debug64(struct qdl_device *qdl, struct sahara_pkt *pkt,
 	if (n < 0)
 		return;
 
-	if (read_req.debug64_req.length == 0 ||
-	    read_req.debug64_req.length > 16 * 1024 * 1024) {
-		ux_err("debug64 table size out of range: 0x%" PRIx64 "\n",
-		       read_req.debug64_req.length);
-		return;
-	}
-
 	table = malloc(read_req.debug64_req.length);
-	if (!table) {
-		ux_err("failed to allocate debug64 table\n");
-		return;
-	}
 
 	n = qdl_read(qdl, table, pkt->debug64_req.length, SAHARA_CMD_TIMEOUT_MS);
-	if (n < 0 || (size_t)n < sizeof(table[0])) {
-		free(table);
+	if (n < 0)
 		return;
-	}
 
-	for (i = 0; i < (size_t)n / sizeof(table[0]); i++) {
+	for (i = 0; i < pkt->debug64_req.length / sizeof(table[0]); i++) {
 		if (sahara_debug64_filter(table[i].filename, filter)) {
 			ux_info("%s skipped per filter\n", table[i].filename);
 			continue;
@@ -459,12 +446,8 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 {
 	struct sahara_pkt *pkt;
 	char buf[4096];
-	size_t buf_len = 0;
 	char tmp[32];
 	bool done = false;
-	bool got_hello = false;
-	bool sent_image_data = false;
-	bool got_eoi = false;
 	int n;
 
 	if (images)
@@ -478,85 +461,27 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 		return 0;
 
 	while (!done) {
-		int retries = 15;
-		bool sent_reset = false;
-
-		/*
-		 * Accumulate data until we have a complete Sahara packet.
-		 * On USB each read returns exactly one packet.  On COM
-		 * port (serial stream) reads can return partial packets
-		 * or multiple packets concatenated together.
-		 */
-		do {
-			if (buf_len >= 8) {
-				pkt = (struct sahara_pkt *)buf;
-				if (buf_len >= pkt->length)
-					break;
-			}
-
-			n = qdl_read(qdl, buf + buf_len,
-				     sizeof(buf) - buf_len,
-				     SAHARA_CMD_TIMEOUT_MS);
-			if (n > 0) {
-				buf_len += n;
-				continue;
-			}
-
-			/*
-			 * On COM port transport (Windows QDLoader/PCIe),
-			 * the initial Sahara hello is almost always lost
-			 * (sent before the port was opened).  Send a
-			 * reset immediately on first failure to trigger
-			 * a fresh hello, then periodically retry.
-			 *
-			 * On USB the hello can also be missed if the
-			 * device just entered EDL and hasn't fully
-			 * initialized — the same reset approach works.
-			 */
-			if (!done && !sent_reset) {
-				sahara_send_reset(qdl);
-				sent_reset = true;
-			} else if (!done && (retries == 9 || retries == 5)) {
-				sahara_send_reset(qdl);
-			}
-		} while (--retries > 0);
-
-		if (buf_len < 8) {
+		n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+		if (n < 0) {
 			ux_err("failed to read sahara request from device\n");
-			if (got_hello && sent_image_data && !got_eoi)
-				ux_err("the programmer was sent but the device "
-				       "stopped responding — this typically "
-				       "means the device has secure boot "
-				       "enabled (fuses blown) and the "
-				       "provided programmer is not signed or "
-				       "not signed with the correct key\n");
 			break;
 		}
 
 		pkt = (struct sahara_pkt *)buf;
-		if (pkt->length < 8 || pkt->length > sizeof(buf)) {
-			ux_err("invalid sahara packet length %u\n",
-			       pkt->length);
-			break;
-		}
-		if (buf_len < pkt->length) {
-			ux_err("incomplete sahara packet (%zu of %u bytes)\n",
-			       buf_len, pkt->length);
-			break;
+		if ((uint32_t)n != pkt->length) {
+			ux_err("request length not matching received request\n");
+			return -EINVAL;
 		}
 
 		switch (pkt->cmd) {
 		case SAHARA_HELLO_CMD:
 			sahara_hello(qdl, pkt);
-			got_hello = true;
 			break;
 		case SAHARA_READ_DATA_CMD:
 			sahara_read(qdl, pkt, images);
-			sent_image_data = true;
 			break;
 		case SAHARA_END_OF_IMAGE_CMD:
 			sahara_eoi(qdl, pkt);
-			got_eoi = true;
 			break;
 		case SAHARA_DONE_RESP_CMD:
 			done = sahara_done(qdl, pkt);
@@ -570,7 +495,6 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			break;
 		case SAHARA_READ_DATA64_CMD:
 			sahara_read64(qdl, pkt, images);
-			sent_image_data = true;
 			break;
 		case SAHARA_RESET_RESP_CMD:
 			assert(pkt->length == SAHARA_RESET_LENGTH);
@@ -579,16 +503,8 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			break;
 		default:
 			sprintf(tmp, "CMD%x", pkt->cmd);
-			print_hex_dump(tmp, buf, pkt->length);
+			print_hex_dump(tmp, buf, n);
 			break;
-		}
-
-		/* Remove consumed packet, keep any trailing data */
-		if (buf_len > pkt->length) {
-			buf_len -= pkt->length;
-			memmove(buf, buf + pkt->length, buf_len);
-		} else {
-			buf_len = 0;
 		}
 	}
 

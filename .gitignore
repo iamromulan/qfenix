@@ -1,6 +1,8 @@
 *.1
 *.o
-qfenix
+qdl
+qdl-ramdump
+ks
 *.exe
 compile_commands.json
 .cache
@@ -8,9 +10,3 @@ compile_commands.json
 version.h
 scripts
 .checkpatch-camelcase.git.
-.scripts/
-.claude/
-CLAUDE.md
-__pycache__
-.DS_Store
-gui/build/

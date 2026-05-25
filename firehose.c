@@ -27,71 +27,11 @@
 #include "oscompat.h"
 #include "vip.h"
 #include "sparse.h"
-#include "gpt.h"
 
 enum {
 	FIREHOSE_ACK = 0,
 	FIREHOSE_NAK,
 };
-
-/*
- * Remainder buffer for serial stream reassembly.
- *
- * On COM port transport, the rawmode ACK XML and the following binary
- * data may arrive concatenated in a single read.  When firehose_read()
- * detects rawmode, it saves any trailing bytes (binary data) here so
- * firehose_issue_read() can consume them before calling qdl_read().
- */
-static char fh_remainder[4096];
-static size_t fh_remainder_len;
-
-static void fh_remainder_save(const char *data, size_t len)
-{
-	if (len > sizeof(fh_remainder))
-		len = sizeof(fh_remainder);
-	memcpy(fh_remainder, data, len);
-	fh_remainder_len = len;
-}
-
-static size_t fh_remainder_drain(void *buf, size_t max)
-{
-	size_t n = fh_remainder_len;
-
-	if (n == 0)
-		return 0;
-	if (n > max)
-		n = max;
-
-	memcpy(buf, fh_remainder, n);
-	fh_remainder_len -= n;
-	if (fh_remainder_len > 0)
-		memmove(fh_remainder, fh_remainder + n, fh_remainder_len);
-
-	return n;
-}
-
-/*
- * Length-limited memory search (like memmem but portable to MSYS2).
- */
-static void *find_in_mem(const void *haystack, size_t hay_len,
-			 const void *needle, size_t needle_len)
-{
-	const char *h = haystack;
-	const char *n = needle;
-	size_t i;
-
-	if (needle_len == 0)
-		return (void *)haystack;
-	if (needle_len > hay_len)
-		return NULL;
-
-	for (i = 0; i <= hay_len - needle_len; i++) {
-		if (h[i] == n[0] && memcmp(h + i, n, needle_len) == 0)
-			return (void *)(h + i);
-	}
-
-	return NULL;
-}
 
 static void xml_setpropf(xmlNode *node, const char *attr, const char *fmt, ...)
 {
@@ -138,8 +78,6 @@ static xmlNode *firehose_response_parse(const void *buf, size_t len, int *error)
 	if (!node) {
 		ux_err("empty firehose response\n");
 		*error = -EINVAL;
-		xmlFreeDoc(doc);
-		return NULL;
 	}
 
 	return node;
@@ -222,7 +160,7 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 	 * consumption of incoming data.
 	 */
 	for (;;) {
-		n = qdl_read(qdl, buf, sizeof(buf) - 1, 100);
+		n = qdl_read(qdl, buf, sizeof(buf), 100);
 
 		/* Timeout after seeing a response, we're done waiting for logs */
 		if (n == -ETIMEDOUT && resp >= 0)
@@ -242,90 +180,15 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 
 		ux_debug("FIREHOSE READ: %s\n", buf);
 
-		/*
-		 * COM port transport may deliver multiple XML documents
-		 * in a single read (serial is a byte stream, unlike USB
-		 * where each bulk transfer is a separate message).
-		 *
-		 * Additionally, a rawmode ACK may arrive concatenated
-		 * with binary data that follows it.  We use the actual
-		 * byte count (n) instead of strlen to handle embedded
-		 * null bytes in binary data, truncate XML fragments at
-		 * </data> boundaries, and save any trailing binary data
-		 * as remainder for the raw-read loop.
-		 */
-		char *frag = buf;
-		size_t buf_left = (size_t)n;
+		node = firehose_response_parse(buf, n, &error);
+		if (!node)
+			return error;
 
-		while (buf_left > 0) {
-			char *next_xml;
-			char *data_end;
-			size_t frag_len;
-			size_t xml_len;
+		ret = response_parser(node, data, &rawmode);
+		xmlFreeDoc(node->doc);
 
-			/*
-			 * Skip leading non-XML bytes — null bytes or
-			 * binary residue from serial stream.
-			 */
-			while (buf_left > 0 && *frag != '<') {
-				frag++;
-				buf_left--;
-			}
-			if (buf_left == 0)
-				break;
-
-			/* Find next <?xml document boundary (null-safe) */
-			next_xml = NULL;
-			if (buf_left > 5)
-				next_xml = find_in_mem(frag + 1, buf_left - 1,
-						       "<?xml", 5);
-
-			frag_len = next_xml ? (size_t)(next_xml - frag)
-					    : buf_left;
-
-			/*
-			 * Truncate at </data> to separate XML from any
-			 * trailing binary data (e.g. rawmode payload).
-			 * Use find_in_mem for null-safety and to stay
-			 * within fragment bounds.
-			 */
-			data_end = find_in_mem(frag, frag_len,
-					       "</data>", 7);
-			xml_len = frag_len;
-			if (data_end)
-				xml_len = (size_t)(data_end - frag) + 7;
-
-			node = firehose_response_parse(frag, xml_len, &error);
-			if (node) {
-				ret = response_parser(node, data, &rawmode);
-				xmlFreeDoc(node->doc);
-
-				if (ret >= 0)
-					resp = ret;
-			}
-
-			if (rawmode) {
-				/*
-				 * Save any data after the XML as
-				 * remainder — this is the start of the
-				 * binary raw-mode payload that arrived
-				 * in the same read.
-				 */
-				char *after = frag + xml_len;
-				size_t leftover = buf_left - xml_len;
-
-				if (leftover > 0)
-					fh_remainder_save(after, leftover);
-				break;
-			}
-
-			if (next_xml) {
-				buf_left -= (size_t)(next_xml - frag);
-				frag = next_xml;
-			} else {
-				break;
-			}
-		}
+		if (ret >= 0)
+			resp = ret;
 
 		if (rawmode)
 			break;
@@ -362,26 +225,22 @@ static int firehose_write(struct qdl_device *qdl, xmlDoc *doc)
 
 	vip_gen_chunk_init(qdl);
 
-	{
-		int retries = 10;
+	for (;;) {
+		ux_debug("FIREHOSE WRITE: %s\n", s);
+		vip_gen_chunk_update(qdl, s, len);
+		ret = qdl_write(qdl, s, len, 1000);
+		saved_errno = errno;
 
-		for (;;) {
-			ux_debug("FIREHOSE WRITE: %s\n", s);
-			vip_gen_chunk_update(qdl, s, len);
-			ret = qdl_write(qdl, s, len, 1000);
-			saved_errno = errno;
-
-			/*
-			 * db410c sometimes sends a <response> followed by
-			 * <log> entries and won't accept write commands
-			 * until these are drained, so attempt to read any
-			 * pending data and then retry the write.
-			 */
-			if (ret < 0 && errno == ETIMEDOUT && retries-- > 0) {
-				firehose_read(qdl, 100, firehose_generic_parser, NULL);
-			} else {
-				break;
-			}
+		/*
+		 * db410c sometimes sense a <response> followed by <log>
+		 * entries and won't accept write commands until these are
+		 * drained, so attempt to read any pending data and then retry
+		 * the write.
+		 */
+		if (ret < 0 && errno == ETIMEDOUT) {
+			firehose_read(qdl, 100, firehose_generic_parser, NULL);
+		} else {
+			break;
 		}
 	}
 	xmlFree(s);
@@ -589,26 +448,6 @@ out:
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
-int firehose_erase_partition(struct qdl_device *qdl, unsigned int partition,
-			     unsigned int start_sector, unsigned int num_sectors,
-			     unsigned int pages_per_block)
-{
-	struct program prog = {};
-	char sector_str[16];
-
-	snprintf(sector_str, sizeof(sector_str), "%u", start_sector);
-	prog.partition = partition;
-	prog.start_sector = sector_str;
-	prog.num_sectors = num_sectors;
-	prog.sector_size = qdl->sector_size;
-	if (pages_per_block) {
-		prog.is_nand = true;
-		prog.pages_per_block = pages_per_block;
-	}
-
-	return firehose_erase(qdl, &prog);
-}
-
 static int firehose_program(struct qdl_device *qdl, struct program *program, int fd)
 {
 	unsigned int num_sectors;
@@ -646,7 +485,7 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 		num_sectors = (sb.st_size + sector_size - 1) / sector_size;
 
 		if (program->num_sectors && num_sectors > program->num_sectors) {
-			ux_err("%s too big for %s truncated to %d\n",
+			ux_err("%s to big for %s truncated to %d\n",
 			       program->filename,
 			       program->label,
 			       program->num_sectors * sector_size);
@@ -670,16 +509,12 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
-	if (program->label)
-		xml_setpropf(node, "label", "%s", program->label);
 	if (program->filename)
 		xml_setpropf(node, "filename", "%s", program->filename);
 
 	if (program->is_nand) {
 		xml_setpropf(node, "PAGES_PER_BLOCK", "%d", program->pages_per_block);
-		/* Only add last_sector if it was explicitly set in the XML */
-		if (program->last_sector)
-			xml_setpropf(node, "last_sector", "%d", program->last_sector);
+		xml_setpropf(node, "last_sector", "%d", program->last_sector);
 	}
 
 	ret = firehose_write(qdl, doc);
@@ -799,46 +634,11 @@ out:
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
-int firehose_program_file(struct qdl_device *qdl, unsigned int partition,
-			  unsigned int start_sector, unsigned int max_sectors,
-			  unsigned int sector_size, unsigned int pages_per_block,
-			  const char *label, const char *filename)
-{
-	struct program prog = {};
-	char sector_str[16];
-	int fd;
-	int ret;
-
-	fd = open(filename, O_RDONLY);
-	if (fd < 0) {
-		ux_err("failed to open %s: %s\n", filename, strerror(errno));
-		return -1;
-	}
-
-	snprintf(sector_str, sizeof(sector_str), "%u", start_sector);
-	prog.partition = partition;
-	prog.start_sector = sector_str;
-	prog.num_sectors = max_sectors;
-	prog.sector_size = sector_size ? sector_size : qdl->sector_size;
-	prog.filename = filename;
-	prog.label = label;
-
-	if (pages_per_block) {
-		prog.is_nand = true;
-		prog.pages_per_block = pages_per_block;
-	}
-
-	ret = firehose_program(qdl, &prog, fd);
-	close(fd);
-	return ret;
-}
-
 static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 			       int fd, void *out_buf, size_t out_len, bool quiet)
 {
 	unsigned int sector_size;
 	size_t chunk_size;
-	size_t buf_size;
 	size_t out_offset = 0;
 	xmlNode *root;
 	xmlNode *node;
@@ -850,20 +650,7 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	int ret;
 	int n;
 
-	/*
-	 * Use a large accumulation buffer to minimise disk-write
-	 * frequency during rawmode.  On serial transports (Windows
-	 * COM port), each write(fd) creates a brief gap during which
-	 * the driver's receive buffer accumulates incoming data.
-	 * With NAND's 16 KB max_payload_size a 120 MB partition
-	 * needs ~7 700 writes, and the cumulative gaps can overflow
-	 * the COM port buffer.  A 1 MB floor reduces that to ~120.
-	 */
-	buf_size = qdl->max_payload_size;
-	if (buf_size < 1024 * 1024)
-		buf_size = 1024 * 1024;
-
-	buf = malloc(buf_size);
+	buf = malloc(qdl->max_payload_size);
 	if (!buf)
 		err(1, "failed to allocate sector buffer");
 
@@ -881,8 +668,6 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
-	if (read_op->pages_per_block)
-		xml_setpropf(node, "PAGES_PER_BLOCK", "%d", read_op->pages_per_block);
 	if (read_op->filename)
 		xml_setpropf(node, "filename", "%s", read_op->filename);
 
@@ -903,56 +688,16 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 
 	left = read_op->num_sectors;
 	while (left > 0) {
-		size_t wanted;
-		size_t got;
+		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
 
-		chunk_size = MIN(buf_size / sector_size, left);
-		wanted = chunk_size * sector_size;
-
-		/*
-		 * On serial transports the rawmode ACK and the start
-		 * of the binary payload may arrive in one read, with
-		 * firehose_read() saving the overflow to a remainder
-		 * buffer.  Drain that first, then read the rest from
-		 * the device, looping as needed since serial reads
-		 * can return partial results.
-		 */
-		got = fh_remainder_drain(buf, wanted);
-		while (got < wanted) {
-			n = qdl_read(qdl, (char *)buf + got,
-				     wanted - got, 30000);
-			if (n < 0) {
-				ux_err("raw read failed (error %d) at %.1f%% of %s\n",
-				       n,
-				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
-				       read_op->filename ? read_op->filename : "?");
-				/*
-				 * Write whatever we received before the
-				 * error so the output file is as complete
-				 * as possible (better to lose a few bytes
-				 * at the end than an entire chunk).
-				 */
-				if (got > 0 && fd >= 0) {
-					int wr __attribute__((unused));
-					wr = write(fd, buf, got);
-				}
-				ret = -1;
-				goto drain;
-			}
-			if (n == 0) {
-				ux_err("unexpected EOF at %.1f%% of %s\n",
-				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
-				       read_op->filename ? read_op->filename : "?");
-				if (got > 0 && fd >= 0) {
-					int wr __attribute__((unused));
-					wr = write(fd, buf, got);
-				}
-				ret = -1;
-				goto drain;
-			}
-			got += (size_t)n;
+		n = qdl_read(qdl, buf, chunk_size * sector_size, 30000);
+		if (n < 0) {
+			err(1, "failed to read");
 		}
-		n = (int)got;
+
+		if ((size_t)n != chunk_size * sector_size) {
+			err(1, "failed to read full sector");
+		}
 
 		if (out_buf) {
 			if ((size_t)n > out_len - out_offset)
@@ -974,26 +719,9 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 			ux_progress("%s", read_op->num_sectors - left, read_op->num_sectors, read_op->filename);
 	}
 
-drain:
-	/*
-	 * Drain remaining rawmode data and the closing ACK so the
-	 * stream is re-synchronised for subsequent commands.
-	 * On failure (mid-read error) discard whatever remains;
-	 * on success this consumes the normal rawmode=false ACK.
-	 */
-	fh_remainder_len = 0;
+	ret = firehose_read(qdl, 10000, firehose_generic_parser, NULL);
 	if (ret) {
-		int drain_n;
-
-		do {
-			drain_n = qdl_read(qdl, buf, buf_size, 2000);
-		} while (drain_n > 0);
-	}
-
-	if (firehose_read(qdl, 10000, firehose_generic_parser, NULL)) {
-		if (!ret)
-			ux_err("read operation failed\n");
-		ret = -1;
+		ux_err("read operation failed\n");
 		goto out;
 	}
 
@@ -1204,7 +932,7 @@ static int firehose_set_bootable(struct qdl_device *qdl, int part)
 	return 0;
 }
 
-int firehose_power(struct qdl_device *qdl, const char *mode, int delay)
+static int firehose_reset(struct qdl_device *qdl)
 {
 	xmlNode *root;
 	xmlNode *node;
@@ -1216,54 +944,28 @@ int firehose_power(struct qdl_device *qdl, const char *mode, int delay)
 	xmlDocSetRootElement(doc, root);
 
 	node = xmlNewChild(root, NULL, (xmlChar *)"power", NULL);
-	xml_setpropf(node, "value", "%s", mode);
-	xml_setpropf(node, "DelayInSeconds", "%d", delay);
+	xml_setpropf(node, "value", "reset");
+	xml_setpropf(node, "DelayInSeconds", "10"); // Add a delay to prevent reboot fail
 
 	ret = firehose_write(qdl, doc);
 	xmlFreeDoc(doc);
 	if (ret < 0)
 		return -1;
 
-	/*
-	 * For reset/off, the device will reboot after 'delay' seconds.
-	 * Read the ACK to confirm the device has parsed and accepted the
-	 * command — without this, closing the USB handle immediately can
-	 * tear down the session before the device finishes processing.
-	 *
-	 * The ACK arrives in ~100ms. Use half the delay as the read
-	 * timeout so we finish well before the device disconnects and
-	 * avoid the macOS libusb hang (IOKit doesn't honor timeouts
-	 * for disconnected USB devices).
-	 */
-	if (strcmp(mode, "reset") == 0 || strcmp(mode, "off") == 0) {
-		int ack_timeout = delay > 0 ? (delay * 1000) / 2 : 500;
-
-		if (ack_timeout < 500)
-			ack_timeout = 500;
-		firehose_read(qdl, ack_timeout, firehose_generic_parser, NULL);
-		ux_info("power %s command sent\n", mode);
-		return 0;
-	}
-
 	ret = firehose_read(qdl, 5000, firehose_generic_parser, NULL);
 	if (ret < 0)
-		ux_err("failed to send power command '%s'\n", mode);
-	/* drain any remaining log messages */
+		ux_err("failed to request device reset\n");
+	/* drain any remaining log messages for reset */
 	else
 		firehose_read(qdl, 1000, firehose_generic_parser, NULL);
 
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
-static int firehose_reset(struct qdl_device *qdl)
-{
-	return firehose_power(qdl, "reset", 10);
-}
-
-int firehose_detect_and_configure(struct qdl_device *qdl,
-				  bool skip_storage_init,
-				  enum qdl_storage_type storage,
-				  unsigned int timeout_s)
+static int firehose_detect_and_configure(struct qdl_device *qdl,
+					 bool skip_storage_init,
+					 enum qdl_storage_type storage,
+					 unsigned int timeout_s)
 {
 	struct timeval timeout = { .tv_sec = timeout_s };
 	struct timeval now;
@@ -1334,7 +1036,7 @@ int firehose_provision(struct qdl_device *qdl)
 
 }
 
-int firehose_run(struct qdl_device *qdl, bool erase_all)
+int firehose_run(struct qdl_device *qdl)
 {
 	bool multiple;
 	int bootable;
@@ -1354,15 +1056,19 @@ int firehose_run(struct qdl_device *qdl, bool erase_all)
 	if (ret)
 		return ret;
 
-	if (erase_all)
-		ret = firehose_op_execute_phased(qdl,
-						 gpt_erase_all_partitions,
-						 firehose_program,
-						 firehose_read_op,
-						 firehose_apply_patch);
-	else
-		ret = firehose_op_execute(qdl, firehose_erase, firehose_program,
-					  firehose_read_op, firehose_apply_patch);
+	ret = erase_execute(qdl, firehose_erase);
+	if (ret)
+		return ret;
+
+	ret = program_execute(qdl, firehose_program);
+	if (ret)
+		return ret;
+
+	ret = patch_execute(qdl, firehose_apply_patch);
+	if (ret)
+		return ret;
+
+	ret = read_op_execute(qdl, firehose_read_op);
 	if (ret)
 		return ret;
 
@@ -1380,170 +1086,4 @@ int firehose_run(struct qdl_device *qdl, bool erase_all)
 	firehose_reset(qdl);
 
 	return 0;
-}
-
-static int firehose_getstorageinfo_parser(xmlNode *node, void *data,
-					  bool *rawmode __unused)
-{
-	struct storage_info *info = data;
-	xmlChar *value;
-	int ret = -EINVAL;
-	char *text;
-	char *eq;
-
-	value = xmlGetProp(node, (xmlChar *)"value");
-	if (!value)
-		return -EINVAL;
-
-	text = (char *)value;
-
-	if (xmlStrcmp(node->name, (xmlChar *)"log") == 0) {
-		ux_log("LOG: %s\n", text);
-
-		/* Parse key=value format (UFS/eMMC programmers) */
-		if ((eq = strstr(text, "total_blocks=")))
-			info->total_blocks = strtoul(eq + 13, NULL, 0);
-		if ((eq = strstr(text, "block_size=")))
-			info->block_size = strtoul(eq + 11, NULL, 0);
-		if ((eq = strstr(text, "page_size=")))
-			info->page_size = strtoul(eq + 10, NULL, 0);
-		if ((eq = strstr(text, "num_physical_partitions=")))
-			info->num_physical = strtoul(eq + 24, NULL, 0);
-		if ((eq = strstr(text, "SECTOR_SIZE_IN_BYTES=")))
-			info->sector_size = strtoul(eq + 21, NULL, 0);
-		if ((eq = strstr(text, "mem_type=")))
-			snprintf(info->mem_type, sizeof(info->mem_type),
-				 "%s", eq + 9);
-		if ((eq = strstr(text, "prod_name=")))
-			snprintf(info->prod_name, sizeof(info->prod_name),
-				 "%s", eq + 10);
-
-		/* Parse JSON format (NAND programmers) */
-		if ((eq = strstr(text, "\"total_blocks\":")))
-			info->total_blocks = strtoul(eq + 15, NULL, 0);
-		if ((eq = strstr(text, "\"block_size\":")))
-			info->block_size = strtoul(eq + 13, NULL, 0);
-		if ((eq = strstr(text, "\"page_size\":")))
-			info->page_size = strtoul(eq + 12, NULL, 0);
-		if ((eq = strstr(text, "\"num_physical\":")))
-			info->num_physical = strtoul(eq + 15, NULL, 0);
-		if ((eq = strstr(text, "\"mem_type\":\""))) {
-			char *end = strchr(eq + 12, '"');
-			if (end) {
-				size_t len = end - (eq + 12);
-				if (len >= sizeof(info->mem_type))
-					len = sizeof(info->mem_type) - 1;
-				memcpy(info->mem_type, eq + 12, len);
-				info->mem_type[len] = '\0';
-			}
-		}
-		if ((eq = strstr(text, "\"prod_name\":\""))) {
-			char *end = strchr(eq + 13, '"');
-			if (end) {
-				size_t len = end - (eq + 13);
-				if (len >= sizeof(info->prod_name))
-					len = sizeof(info->prod_name) - 1;
-				memcpy(info->prod_name, eq + 13, len);
-				info->prod_name[len] = '\0';
-			}
-		}
-
-		ret = -EAGAIN;
-	} else if (xmlStrcmp(value, (xmlChar *)"ACK") == 0) {
-		ret = FIREHOSE_ACK;
-	} else if (xmlStrcmp(value, (xmlChar *)"NAK") == 0) {
-		ret = FIREHOSE_NAK;
-	}
-
-	xmlFree(value);
-	return ret;
-}
-
-int firehose_getstorageinfo(struct qdl_device *qdl,
-			    unsigned int phys_partition,
-			    struct storage_info *info)
-{
-	xmlNode *root;
-	xmlNode *node;
-	xmlDoc *doc;
-	int ret;
-
-	memset(info, 0, sizeof(*info));
-
-	doc = xmlNewDoc((xmlChar *)"1.0");
-	root = xmlNewNode(NULL, (xmlChar *)"data");
-	xmlDocSetRootElement(doc, root);
-
-	node = xmlNewChild(root, NULL, (xmlChar *)"getstorageinfo", NULL);
-	xml_setpropf(node, "physical_partition_number", "%d", phys_partition);
-
-	ret = firehose_write(qdl, doc);
-	xmlFreeDoc(doc);
-	if (ret < 0)
-		return -1;
-
-	ret = firehose_read(qdl, 10000, firehose_getstorageinfo_parser, info);
-	return ret == FIREHOSE_ACK ? 0 : -1;
-}
-
-int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
-			  unsigned int start_sector, unsigned int num_sectors,
-			  unsigned int sector_size, unsigned int pages_per_block,
-			  const char *filename)
-{
-	struct read_op op;
-	char start_str[32];
-	unsigned int sectors_done = 0;
-	int retries_left = 3;
-	int fd;
-	int ret;
-
-	if (!sector_size)
-		sector_size = qdl->sector_size;
-
-	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
-	if (fd < 0) {
-		ux_err("failed to open %s for writing: %s\n",
-		       filename, strerror(errno));
-		return -1;
-	}
-
-retry:
-	snprintf(start_str, sizeof(start_str), "%u",
-		 start_sector + sectors_done);
-
-	memset(&op, 0, sizeof(op));
-	op.sector_size = sector_size;
-	op.pages_per_block = pages_per_block;
-	op.start_sector = start_str;
-	op.num_sectors = num_sectors - sectors_done;
-	op.partition = partition;
-	op.filename = filename;
-
-	ret = firehose_issue_read(qdl, &op, fd, NULL, 0, false);
-	if (ret && retries_left > 0) {
-		/*
-		 * Check how many complete sectors were written.
-		 * If we made progress, seek back to the sector
-		 * boundary (in case of a partial write) and retry
-		 * the remaining sectors with a new read command.
-		 */
-		off_t pos = lseek(fd, 0, SEEK_CUR);
-		unsigned int written = pos > 0 ?
-			(unsigned int)(pos / sector_size) : 0;
-
-		if (written > sectors_done) {
-			sectors_done = written;
-			lseek(fd, (off_t)sectors_done * sector_size,
-			      SEEK_SET);
-			retries_left--;
-			ux_info("retrying from sector %u (%u of %u remaining)\n",
-				start_sector + sectors_done,
-				num_sectors - sectors_done, num_sectors);
-			goto retry;
-		}
-	}
-
-	close(fd);
-	return ret;
 }

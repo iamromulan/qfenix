@@ -2,7 +2,6 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <time.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +11,6 @@
 #include "oscompat.h"
 
 #include "qdl.h"
-#include "usb_ids.h"
-#include "diag_switch.h"
 
 #define DEFAULT_OUT_CHUNK_SIZE (1024 * 1024)
 
@@ -88,8 +85,10 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		return -1;
 	}
 
-	/* Consider only known EDL-mode devices */
-	if (!is_edl_device(desc.idVendor, desc.idProduct))
+	/* Consider only devices with vid 0x0506 and known product id */
+	if (desc.idVendor != 0x05c6)
+		return 0;
+	if (desc.idProduct != 0x9008 && desc.idProduct != 0x900e && desc.idProduct != 0x901d)
 		return 0;
 
 	ret = libusb_get_active_config_descriptor(dev, &config);
@@ -136,18 +135,7 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 
 		ret = libusb_open(dev, &handle);
 		if (ret < 0) {
-#ifdef _WIN32
-			/*
-			 * NOT_SUPPORTED means no WinUSB driver (e.g.
-			 * QDLoader driver is installed instead).
-			 */
-			if (ret == LIBUSB_ERROR_NOT_SUPPORTED) {
-				libusb_free_config_descriptor(config);
-				return -2;
-			}
-#endif
-			warnx("unable to open USB device: %s",
-			      libusb_strerror(ret));
+			warnx("unable to open USB device");
 			continue;
 		}
 
@@ -172,7 +160,7 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		qdl->out_maxpktsize = out_size;
 
 		if (qdl->out_chunk_size && qdl->out_chunk_size % out_size) {
-			ux_warn("WARNING: requested out-chunk-size must be multiple of the device's wMaxPacketSize %ld, using %ld\n",
+			ux_err("WARNING: requested out-chunk-size must be multiple of the device's wMaxPacketSize %ld, using %ld\n",
 			       out_size, out_size);
 			qdl->out_chunk_size = out_size;
 		} else if (!qdl->out_chunk_size) {
@@ -195,24 +183,16 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 	struct libusb_device *dev;
 	struct qdl_device_usb *qdl_usb = container_of(qdl, struct qdl_device_usb, base);
 	bool wait_printed = false;
-	bool diag_attempted = false;
 	bool found = false;
-	time_t wait_start = 0;
 	ssize_t n;
 	int ret;
 	int i;
-#ifdef _WIN32
-	int not_supported_scans = 0;
-#endif
 
 	ret = libusb_init(NULL);
 	if (ret < 0)
 		err(1, "failed to initialize libusb");
 
 	for (;;) {
-#ifdef _WIN32
-		bool scan_not_supported = false;
-#endif
 		n = libusb_get_device_list(NULL, &devs);
 		if (n < 0)
 			err(1, "failed to list USB devices");
@@ -225,58 +205,17 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 				found = true;
 				break;
 			}
-#ifdef _WIN32
-			if (ret == -2)
-				scan_not_supported = true;
-#endif
 		}
 
 		libusb_free_device_list(devs, 1);
 
-		if (found) {
-			if (wait_printed)
-				fprintf(stderr, "\n");
+		if (found)
 			return 0;
-		}
-
-#ifdef _WIN32
-		/*
-		 * EDL device found but the USB driver is not WinUSB-
-		 * compatible (e.g. Qualcomm QDLoader 9008 driver).
-		 * Signal the caller to fall back to COM port transport.
-		 */
-		if (scan_not_supported) {
-			if (++not_supported_scans >= 1) {
-				ux_info("USB driver not WinUSB-compatible, trying COM port...\n");
-				libusb_exit(NULL);
-				return -2;
-			}
-		} else {
-			not_supported_scans = 0;
-		}
-#endif
-
-		/* Try DIAG-to-EDL switch if enabled and not yet attempted */
-		if (qdl_auto_edl && !diag_attempted) {
-			if (diag_is_device_in_diag_mode(serial)) {
-				ux_info("Device in DIAG mode, switching to EDL...\n");
-				if (diag_switch_to_edl(serial) == 0) {
-					ux_info("EDL switch sent, waiting for re-enumeration...\n");
-					sleep(3);
-				}
-				diag_attempted = true;
-				continue;
-			}
-		}
 
 		if (!wait_printed) {
-			wait_start = time(NULL);
+			ux_info("Waiting for EDL device\n");
 			wait_printed = true;
 		}
-		fprintf(stderr, "\rWaiting for EDL device... "
-			"(Ctrl+C to abort) [%ds]",
-			(int)(time(NULL) - wait_start));
-		fflush(stderr);
 
 		usleep(250000);
 	}
@@ -306,13 +245,10 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 	device_count = libusb_get_device_list(NULL, &devices);
 	if (device_count < 0)
 		err(1, "failed to list USB devices");
-	if (device_count == 0) {
-		libusb_free_device_list(devices, 1);
-		libusb_exit(NULL);
+	if (device_count == 0)
 		return NULL;
-	}
 
-	result = calloc(device_count, sizeof(struct qdl_device_desc));
+	result = calloc(device_count, sizeof(struct qdl_device));
 	if (!result)
 		err(1, "failed to allocate devices array\n");
 
@@ -325,20 +261,20 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 			continue;
 		}
 
-		if (!is_edl_device(desc.idVendor, desc.idProduct))
+		if (desc.idVendor != 0x05c6)
+			continue;
+		if (desc.idProduct != 0x9008 && desc.idProduct != 0x900e && desc.idProduct != 0x901d)
 			continue;
 
 		ret = libusb_open(dev, &handle);
 		if (ret < 0) {
-			warnx("unable to open USB device: %s",
-			      libusb_strerror(ret));
+			warnx("unable to open USB device");
 			continue;
 		}
 
 		ret = libusb_get_string_descriptor_ascii(handle, desc.iProduct, buf, sizeof(buf) - 1);
 		if (ret < 0) {
 			warnx("failed to read iProduct descriptor: %s", libusb_strerror(ret));
-			libusb_close(handle);
 			continue;
 		}
 		buf[ret] = '\0';
@@ -346,7 +282,6 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 		serial = strstr((char *)buf, "_SN:");
 		if (!serial) {
 			ux_err("ignoring device with no serial number\n");
-			libusb_close(handle);
 			continue;
 		}
 
@@ -354,7 +289,6 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 		serial_len = strcspn(serial, " _");
 		if (serial_len + 1 > sizeof(result[count].serial)) {
 			ux_err("ignoring device with unexpectedly long serial number\n");
-			libusb_close(handle);
 			continue;
 		}
 
@@ -364,92 +298,9 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 		result[count].vid = desc.idVendor;
 		result[count].pid = desc.idProduct;
 		count++;
-		libusb_close(handle);
 	}
 
 	libusb_free_device_list(devices, 1);
-	libusb_exit(NULL);
-	*devices_found = count;
-
-	return result;
-}
-
-struct usb_adb_desc *usb_list_adb(unsigned int *devices_found)
-{
-	struct libusb_device **devices;
-	struct usb_adb_desc *result;
-	ssize_t device_count;
-	unsigned int count = 0;
-	int ret;
-	int i;
-
-	*devices_found = 0;
-
-	ret = libusb_init(NULL);
-	if (ret < 0)
-		return NULL;
-
-	device_count = libusb_get_device_list(NULL, &devices);
-	if (device_count <= 0) {
-		if (device_count == 0)
-			libusb_free_device_list(devices, 1);
-		libusb_exit(NULL);
-		return NULL;
-	}
-
-	result = calloc(device_count, sizeof(struct usb_adb_desc));
-	if (!result) {
-		libusb_free_device_list(devices, 1);
-		libusb_exit(NULL);
-		return NULL;
-	}
-
-	for (i = 0; i < device_count; i++) {
-		struct libusb_device_descriptor desc;
-		struct libusb_config_descriptor *config;
-		int j, k;
-
-		ret = libusb_get_device_descriptor(devices[i], &desc);
-		if (ret < 0)
-			continue;
-
-		if (!is_diag_vendor(desc.idVendor))
-			continue;
-
-		/* Skip EDL devices */
-		if (is_edl_device(desc.idVendor, desc.idProduct))
-			continue;
-
-		ret = libusb_get_active_config_descriptor(devices[i],
-							  &config);
-		if (ret < 0)
-			continue;
-
-		for (j = 0; j < config->bNumInterfaces; j++) {
-			const struct libusb_interface *iface;
-
-			iface = &config->interface[j];
-			for (k = 0; k < iface->num_altsetting; k++) {
-				const struct libusb_interface_descriptor *alt;
-
-				alt = &iface->altsetting[k];
-				if (alt->bInterfaceClass == 0xFF &&
-				    alt->bInterfaceSubClass == 0x42 &&
-				    alt->bInterfaceProtocol == 0x01) {
-					result[count].vid = desc.idVendor;
-					result[count].pid = desc.idProduct;
-					result[count].iface = alt->bInterfaceNumber;
-					count++;
-					goto next_device;
-				}
-			}
-		}
-next_device:
-		libusb_free_config_descriptor(config);
-	}
-
-	libusb_free_device_list(devices, 1);
-	libusb_exit(NULL);
 	*devices_found = count;
 
 	return result;

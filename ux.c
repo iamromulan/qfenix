@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <stdarg.h>
-#include <stdlib.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -23,21 +22,13 @@ static const char * const progress_dashes = DASHES;
 static unsigned int ux_width;
 static unsigned int ux_cur_line_length;
 
-static bool ux_color_stdout;
-static bool ux_color_stderr;
-
 /*
  * Levels of output:
  *
- * error: used to signal errors to the user (red)
- * warn:  used for warnings (yellow)
- * info:  used to inform the user about progress (mint green)
- * logs:  log prints from the device
+ * error: used to signal errors to the user
+ * info: used to inform the user about progress
+ * logs: log prints from the device
  * debug: protocol logs
- *
- * When qdl_log_file is set, ALL levels (including log/debug) are
- * written to the file regardless of qdl_debug, giving a full
- * debug-level log without cluttering the terminal.
  */
 
 /* Clear ux_cur_line_length characters of the progress bar from the screen */
@@ -53,54 +44,16 @@ static void ux_clear_line(void)
 
 #ifdef _WIN32
 
-#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
-#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
-#endif
-
 void ux_init(void)
 {
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
-	HANDLE hOut, hErr;
-	DWORD mode;
-	char *env;
 	int columns;
 
-	hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-	hErr = GetStdHandle(STD_ERROR_HANDLE);
+	HANDLE stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
 
-	if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+	if (GetConsoleScreenBufferInfo(stdoutHandle, &csbi)) {
 		columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
 		ux_width = MIN(columns, UX_PROGRESS_SIZE_MAX);
-	}
-
-	/* Allow COLUMNS env var to override (e.g. GUI subprocess with piped stdout) */
-	env = getenv("COLUMNS");
-	if (env) {
-		int cols = atoi(env);
-
-		if (cols > 0)
-			ux_width = MIN((unsigned int)cols, UX_PROGRESS_SIZE_MAX);
-	}
-
-	if (getenv("NO_COLOR"))
-		return;
-
-	/* Enable ANSI escape processing on stdout */
-	if (GetConsoleMode(hOut, &mode)) {
-		if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-			ux_color_stdout = true;
-	}
-
-	/* Enable ANSI escape processing on stderr */
-	if (GetConsoleMode(hErr, &mode)) {
-		if (SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-			ux_color_stderr = true;
-	}
-
-	/* FORCE_COLOR overrides console mode check (e.g. GUI subprocess) */
-	if (getenv("FORCE_COLOR")) {
-		ux_color_stdout = true;
-		ux_color_stderr = true;
 	}
 }
 
@@ -109,175 +62,67 @@ void ux_init(void)
 void ux_init(void)
 {
 	struct winsize w;
-	char *env;
 	int ret;
 
 	ret = ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
 	if (!ret)
 		ux_width = MIN(w.ws_col, UX_PROGRESS_SIZE_MAX);
-
-	/* Allow COLUMNS env var to override (e.g. GUI subprocess with piped stdout) */
-	env = getenv("COLUMNS");
-	if (env) {
-		int cols = atoi(env);
-
-		if (cols > 0)
-			ux_width = MIN((unsigned int)cols, UX_PROGRESS_SIZE_MAX);
-	}
-
-	if (getenv("NO_COLOR"))
-		return;
-
-	ux_color_stdout = isatty(STDOUT_FILENO);
-	ux_color_stderr = isatty(STDERR_FILENO);
-
-	/* FORCE_COLOR overrides isatty (e.g. GUI subprocess with piped stdout) */
-	if (getenv("FORCE_COLOR")) {
-		ux_color_stdout = true;
-		ux_color_stderr = true;
-	}
 }
 
 #endif
 
 void ux_err(const char *fmt, ...)
 {
-	va_list ap, ap_log;
+	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_log_file)
-		va_copy(ap_log, ap);
-
-	if (ux_color_stderr)
-		fputs(UX_COLOR_RED, stderr);
 	vfprintf(stderr, fmt, ap);
-	if (ux_color_stderr)
-		fputs(UX_COLOR_RESET, stderr);
-	fflush(stderr);
 	va_end(ap);
-
-	if (qdl_log_file) {
-		fputs("[ERROR] ", qdl_log_file);
-		vfprintf(qdl_log_file, fmt, ap_log);
-		fflush(qdl_log_file);
-		va_end(ap_log);
-	}
-}
-
-void ux_warn(const char *fmt, ...)
-{
-	va_list ap, ap_log;
-
-	ux_clear_line();
-
-	va_start(ap, fmt);
-	if (qdl_log_file)
-		va_copy(ap_log, ap);
-
-	if (ux_color_stderr)
-		fputs(UX_COLOR_YELLOW, stderr);
-	vfprintf(stderr, fmt, ap);
-	if (ux_color_stderr)
-		fputs(UX_COLOR_RESET, stderr);
 	fflush(stderr);
-	va_end(ap);
-
-	if (qdl_log_file) {
-		fputs("[WARN]  ", qdl_log_file);
-		vfprintf(qdl_log_file, fmt, ap_log);
-		fflush(qdl_log_file);
-		va_end(ap_log);
-	}
 }
 
 void ux_info(const char *fmt, ...)
 {
-	va_list ap, ap_log;
+	va_list ap;
 
 	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_log_file)
-		va_copy(ap_log, ap);
-
-	if (ux_color_stdout)
-		fputs(UX_COLOR_GREEN, stdout);
 	vprintf(fmt, ap);
-	if (ux_color_stdout)
-		fputs(UX_COLOR_RESET, stdout);
-	fflush(stdout);
 	va_end(ap);
-
-	if (qdl_log_file) {
-		fputs("[INFO]  ", qdl_log_file);
-		vfprintf(qdl_log_file, fmt, ap_log);
-		fflush(qdl_log_file);
-		va_end(ap_log);
-	}
+	fflush(stdout);
 }
 
 void ux_log(const char *fmt, ...)
 {
-	va_list ap, ap_log;
+	va_list ap;
+
+	if (!qdl_debug)
+		return;
+
+	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_log_file)
-		va_copy(ap_log, ap);
-
-	if (qdl_debug) {
-		ux_clear_line();
-		vprintf(fmt, ap);
-		fflush(stdout);
-	}
+	vprintf(fmt, ap);
 	va_end(ap);
-
-	if (qdl_log_file) {
-		fputs("[LOG]   ", qdl_log_file);
-		vfprintf(qdl_log_file, fmt, ap_log);
-		fflush(qdl_log_file);
-		va_end(ap_log);
-	}
+	fflush(stdout);
 }
 
 void ux_debug(const char *fmt, ...)
 {
-	va_list ap, ap_log;
+	va_list ap;
+
+	if (!qdl_debug)
+		return;
+
+	ux_clear_line();
 
 	va_start(ap, fmt);
-	if (qdl_log_file)
-		va_copy(ap_log, ap);
-
-	if (qdl_debug) {
-		ux_clear_line();
-		vprintf(fmt, ap);
-		fflush(stdout);
-	}
+	vprintf(fmt, ap);
 	va_end(ap);
-
-	if (qdl_log_file) {
-		fputs("[DEBUG] ", qdl_log_file);
-		vfprintf(qdl_log_file, fmt, ap_log);
-		fflush(qdl_log_file);
-		va_end(ap_log);
-	}
-}
-
-void ux_fputs_color(FILE *f, const char *color, const char *text)
-{
-	bool use_color = false;
-
-	if (f == stdout)
-		use_color = ux_color_stdout;
-	else if (f == stderr)
-		use_color = ux_color_stderr;
-
-	if (use_color)
-		fputs(color, f);
-	fputs(text, f);
-	if (use_color)
-		fputs(UX_COLOR_RESET, f);
+	fflush(stdout);
 }
 
 void ux_progress(const char *fmt, unsigned int value, unsigned int max, ...)

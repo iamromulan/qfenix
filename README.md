@@ -1,262 +1,285 @@
-# QFenix
+# Qualcomm Download
 
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![Build on push](https://github.com/linux-msm/qdl/actions/workflows/build.yml/badge.svg)](https://github.com/linux-msm/qdl/actions/workflows/build.yml/badge.svg)
 
-An enhanced fork of [linux-msm/qdl](https://github.com/linux-msm/qdl) — a Swiss Army knife
-for Qualcomm-based modems and devices. Flash firmware, read/write NV items, browse EFS,
-send/receive SMS, interactive AT console, and more — all from a single binary.
+This tool communicates with Qualcomm EDL USB devices (Vendor ID `05c6`, Product
+IDs `9008`, `900e`, `901d`) to upload a flash loader and use it to flash images.
 
-## Download
+## Build
 
-Pre-built static binaries for Linux (x64, arm64, armv7), macOS (universal), and
-Windows (x64, x86, arm64) are available under
-[Releases](https://github.com/iamromulan/qfenix/releases).
-
-## Quick Start
+### Linux
 
 ```bash
-# Flash firmware (auto-detect programmer, XMLs, and storage type)
-qfenix flash /path/to/firmware/
-
-# List connected devices (EDL, DIAG, AT, ADB, PCIe)
-qfenix list
-
-# Backup EFS to XQCN (default, QPST-compatible)
-qfenix efsbackup -o backup.xqcn
-
-# Interactive AT console
-qfenix atconsole
-
-# Send an SMS
-qfenix smssend +15551234567 "Hello from qfenix"
-
-# Read all partitions save to file and make xml (-L /loader/search/path)
-qfenix readall -L ./ -o ./
-```
-
-## Key Features
-
-- **Auto firmware detection** — `-F` recursively finds programmer ELF, rawprogram/patch XMLs, and detects storage type from any directory layout and -L is used to search for the loader automatically from a starting path.
-- **Full DIAG protocol** — NV read/write, complete EFS management, backup/restore to XQCN or TAR
-- **SMS & USSD** — Send/receive SMS, delete messages, send USSD queries over AT commands
-- **AT console** — Interactive terminal for AT commands with real-time URC display (Linux, macOS, Windows)
-- **PCIe/MHI transport** — Flash PCIe modems (T99W175, T99W373, T99W640, etc.) on Linux and Windows
-- **DIAG-to-EDL auto-switch** — Detects DIAG mode and switches to EDL automatically
-- **GPT operations** — Print partitions, A/B slots, read/erase/dump partitions by label
-- **Wide device support** — Quectel, Sierra, Telit, Fibocom, Foxconn/Dell, Simcom, MeiG, and more
-- **Document-order XML execution** — Operations run in XML order, enabling backup-erase-flash workflows
-- **Cross-platform** — Linux, macOS, and Windows from a single codebase
-
----
-
-## Common Workflows
-
-### Flash firmware
-
-```bash
-# Auto-detect everything from a firmware directory
-qfenix -F /path/to/firmware/
-
-# Traditional mode
-qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
-
-# Target a specific device
-qfenix --serial=0AA94EFD -F /path/to/firmware/       # by USB serial
-qfenix --serial=COM49 -F /path/to/firmware/           # by COM port (Windows)
-
-# PCIe modem
-qfenix --pcie -F /path/to/firmware/
-
-# Erase-all workflow
-qfenix flash -e -F /path/to/firmware/
-```
-
-The device must be in EDL mode. QFenix auto-switches from DIAG to EDL
-(disable with `--no-auto-edl`).
-
-### EFS backup & restore
-
-```bash
-# Backup to XQCN (default — includes NV items, QPST-compatible)
-qfenix efsbackup
-qfenix efsbackup -o my_backup.xqcn
-
-# Backup to TAR (probe-based path coverage)
-qfenix efsbackup -t -o backup.tar
-qfenix efsbackup -t --quick -o quick.tar     # tree walk only, faster
-
-# Restore (format auto-detected)
-qfenix efsrestore backup.xqcn
-qfenix efsrestore backup.tar
-
-# Offline format conversion (no device needed)
-qfenix xqcn2tar backup.xqcn output.tar
-qfenix tar2xqcn backup.tar output.xqcn
-```
-
-### NV items & EFS
-
-```bash
-# NV items
-qfenix nvread 0                              # read NV item 0 (ESN)
-qfenix nvread 6828 --index=0                 # with subscription index
-qfenix nvwrite 6828 0102030405               # write hex data
-
-# EFS filesystem
-qfenix efsls /                               # list directory
-qfenix efspull /nv/item_files/file.bin ./     # download file
-qfenix efspush ./file.bin /nv/item_files/     # upload file
-qfenix efsrm -r /custapp/mydir               # recursive delete
-```
-
-### SMS & AT commands
-
-```bash
-# SMS
-qfenix smssend +15551234567 "Hello"          # send SMS
-qfenix smsread                               # list received SMS
-qfenix smsread -j                            # JSON output
-qfenix smsrm all                             # delete all messages
-qfenix smsstatus                             # storage status
-
-# USSD
-qfenix ussd "*#06#"                          # query IMEI
-
-# Raw AT command
-qfenix atcmd AT+COPS?                        # single command
-
-# Interactive AT console
-qfenix atconsole                             # auto-detect port
-qfenix atconsole -p COM9                     # specify port
-```
-
-### Partitions & GPT
-
-```bash
-# Inspect
-qfenix printgpt prog_firehose_ddr.elf
-qfenix getslot prog_firehose_ddr.elf
-qfenix storageinfo prog_firehose_ddr.elf
-
-# Read partitions
-qfenix read modem -L /path/to/firmware/
-qfenix readall -L /path/to/firmware/ -o /path/to/output/
-
-# Erase
-qfenix erase modemst1 modemst2 -L /path/to/firmware/
-qfenix eraseall -L /path/to/firmware/
-```
-
----
-
-## Full Command Reference
-
-Every subcommand supports `--help` for detailed usage.
-
-### Flashing & Storage
-
-These commands require a programmer ELF and a device in EDL mode.
-
-| Command | Description |
-|---------|-------------|
-| *(default)* / `flash` | Flash firmware via Firehose protocol |
-| `printgpt` | Print GPT partition tables (supports `--make-xml` for XML generation) |
-| `storageinfo` | Query storage hardware info |
-| `reset` | Reset, power off, or reboot into EDL |
-| `getslot` | Show active A/B slot |
-| `setslot` | Set active A/B slot |
-| `read` | Read partition(s) by label |
-| `readall` | Dump all partitions (supports `--single-file` for full storage dump) |
-| `erase` | Erase partition(s) by label or raw sector range |
-| `eraseall` | Erase all partitions |
-
-### DIAG Operations
-
-Work directly over the DIAG serial port — no programmer or EDL mode needed.
-
-| Command | Description |
-|---------|-------------|
-| `diag2edl` | Switch device from DIAG to EDL mode |
-| `nvread` | Read NV item (supports `--index` for subscriptions) |
-| `nvwrite` | Write NV item from hex data |
-| `efsls` | List EFS directory |
-| `efspull` | Download file from EFS |
-| `efspush` | Upload file to EFS |
-| `efsrm` | Delete file or directory (`-r` for recursive) |
-| `efsstat` | Show file/directory metadata |
-| `efsmkdir` | Create EFS directory |
-| `efschmod` | Change permissions |
-| `efsln` | Create symlink |
-| `efsrl` | Read symlink target |
-| `efsdump` | Dump EFS factory image |
-| `efsbackup` | Backup EFS to XQCN (default) or TAR (`-t`) |
-| `efsrestore` | Restore EFS from XQCN or TAR (auto-detected) |
-| `xqcn2tar` | Convert XQCN to TAR (offline, no device) |
-| `tar2xqcn` | Convert TAR to XQCN (offline, no device) |
-
-### AT / SMS / USSD
-
-Work over the AT serial port — no programmer or EDL mode needed.
-
-| Command | Description |
-|---------|-------------|
-| `atcmd` | Send a raw AT command |
-| `atconsole` | Interactive AT console with real-time URC display |
-| `smssend` | Send SMS via PDU mode |
-| `smsread` | List/read SMS messages (`-j` for JSON, `-r` for raw PDU) |
-| `smsrm` | Delete SMS by index or all |
-| `smsstatus` | Query SMS storage status |
-| `ussd` | Send USSD/USSI query |
-
-### Other
-
-| Command | Description |
-|---------|-------------|
-| `list` | List connected EDL, DIAG, AT, ADB, and PCIe devices |
-| `ramdump` | Extract RAM dumps via Sahara |
-| `ks` | Keystore/Sahara over serial device nodes |
-
----
-
-## Supported Devices
-
-QFenix includes a VID/PID database for automatic detection of:
-
-- **Qualcomm** reference designs (SDX55, SDX65, SDX72, SDX75)
-- **Quectel** (EM05, EM06, EM12, EM060K, EM120K, RM520N, RM255C, RG650V, etc.)
-- **Sierra Wireless** (EM74xx, EM9190, EM9191, EM9291)
-- **Telit** (LM960, FN980, FN990, FM990, LE910C4)
-- **Fibocom** (FM150, FM160)
-- **Foxconn/Dell** (DW5820e, DW5930e, DW5931e, DW5934e / T99W175, T99W373, T99W640)
-- **Simcom** (SIM8200EA, SIM8380G)
-- **MeiG Smart** (SRM825, SRM930)
-- **Sony, ZTE, LG, Netgear, Huawei** EDL/DIAG devices
-
-PCIe modems (MHI-based) are detected via friendly name matching on Windows.
-
-## Build from Source
-
-```bash
-# Linux
 sudo apt install libxml2-dev libusb-1.0-0-dev help2man
 make
+```
 
-# macOS (Homebrew)
+### MacOS
+
+For Homebrew users:
+
+```bash
 brew install libxml2 pkg-config libusb help2man
 make
+```
 
-# macOS (MacPorts)
+For MacPorts users:
+
+```bash
 sudo port install libxml2 pkgconfig libusb help2man
 make
+```
 
-# Windows (MSYS2 MinGW64 terminal)
-pacman -S base-devel git mingw-w64-x86_64-{gcc,make,pkg-config,libusb,libxml2}
+### Windows
+
+First, install the [MSYS2 environment](https://www.msys2.org/). Then, run the
+MSYS2 MinGW64 terminal (located at `<msys2-installation-path>\mingw64.exe`) and
+install additional packages needed for QDL compilation using the `pacman` tool:
+
+```bash
+pacman -S base-devel --needed
+pacman -S git
+pacman -S help2man
+pacman -S mingw-w64-x86_64-gcc
+pacman -S mingw-w64-x86_64-make
+pacman -S mingw-w64-x86_64-pkg-config
+pacman -S mingw-w64-x86_64-libusb
+pacman -S mingw-w64-x86_64-libxml2
+```
+
+Then use the `make` tool to build QDL:
+
+```bash
 make
+```
 
-# Run tests
+## Use QDL
+
+### EDL mode
+
+The device intended for flashing must be booted into **Emergency Download (EDL)**
+mode. EDL is a special boot mode available on Qualcomm-based devices that provides
+low-level access for firmware flashing and recovery. It bypasses the standard boot
+process, allowing operations such as flashing firmware even on unresponsive devices
+or those with locked bootloaders.
+
+Please consult your device’s documentation for instructions on how to enter EDL mode.
+
+### Flash device
+
+Run QDL with the `--help` option to view detailed usage information.
+
+Below is an example of how to invoke QDL to flash a FLAT build:
+
+```bash
+qdl prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+If you have multiple boards connected to the host, provide the serial number of
+the board to flash through the `--serial` option:
+
+```bash
+qdl --serial=0AA94EFD prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+### Flash simulation (dry run)
+
+Use the `--dry-run` option to run QDL without connecting to or flashing any
+device. This is useful for validating your XML descriptors and programmer
+arguments, or for generating VIP digest tables (see below):
+
+```bash
+qdl --dry-run prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+### Reading and writing raw binaries
+
+In addition to flashing builds using their XML-based descriptions, QDL supports
+reading and writing binaries directly.
+
+```bash
+qdl prog_firehose_ddr.elf [read | write] [address specifier] <binary>...
+```
+
+Multiple read and write commands can be specified at once. The ***address
+specifier*** can take the forms:
+
+- N - single number, specifies the physical partition number N, starting at
+  sector 0. To read data, the number of sectors must be specified explicitly
+  using the N/S+L form.
+
+- N/S - two numbers, specifies the physical partition number N and the start
+  sector S. To read data, the number of sectors must be specified explicitly
+  using the N/S+L form.
+
+- N/S+L - three numbers, specifies the physical partition number N, the start
+  sector S and the number of sectors L, that ***binary*** should be written to,
+  or which should be read into ***binary***.
+
+- partition name - a string, will match against partition names across the GPT
+  partition tables on all physical partitions.
+
+- N/partition_name - a number followed by a string, will match against
+  partition names of the GPT partition table in the specified physical
+  partition N.
+
+### Validated Image Programming (VIP)
+
+QDL supports **Validated Image Programming (VIP)** mode, which is activated
+when Secure Boot is enabled on the target. VIP controls which packets are
+allowed to be issued to the target by hashing all received data and comparing
+each resulting digest against the next entry in a pre-loaded digest table.
+If the digest matches, the packet is accepted; otherwise, the packet is
+rejected, and the target halts.
+
+To use VIP programming, a digest table must be generated prior to flashing the device.
+To generate a table of digests, run QDL with the `--create-digests` option,
+providing a path to store the VIP tables. Note that `--create-digests`
+implicitly enables dry-run mode, so no device connection is required:
+
+```bash
+mkdir vip
+qdl --create-digests=./vip prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+As a result, three types of files are generated:
+
+- `DIGEST_TABLE.bin` - contains the SHA256 table of digests for all Firehose
+  packets to be sent to the target. It is an intermediary table and is
+  used only for the subsequent generation of `DigestsToSign.bin` and
+  `ChainedTableOfDigests<n>.bin` files, and is not used directly by QDL for
+  VIP programming.
+
+- `DigestsToSign.bin` - first 53 digests + SHA256 hash of `ChainedTableOfDigests0.bin`.
+  This file must be converted to MBN format and then signed with sectools:
+
+  ```bash
+  sectools mbn-tool generate --data DigestsToSign.bin --mbn-version 6 --outfile DigestsToSign.bin.mbn
+  sectools secure-image --sign DigestsToSign.bin.mbn --image-id=VIP
+  ```
+
+  Please check the security profile for your SoC to determine which version of
+  the MBN format should be used.
+
+- `ChainedTableOfDigests<n>.bin` - contains the remaining digests, split across
+  multiple files of up to 255 digests each. Non-final files have the SHA256
+  hash of the next chained table appended. The final file has a trailing zero
+  byte appended to ensure its size is not a multiple of the sector size.
+
+To flash a board using VIP mode, provide the path where the previously generated
+and signed tables are stored using the `--vip-table-path` option:
+
+```bash
+qdl --vip-table-path=./vip prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+Note that `--vip-table-path` and `--create-digests` are mutually exclusive.
+
+### Multi-programmer targets
+
+On some targets multiple files need to be loaded in order to reach the
+Firehose programmer; these targets will request multiple images over Sahara.
+Three mechanisms for providing these images are provided:
+
+#### Command line argument
+
+The *programmer* argument allows specifying a comma-separated list of
+colon-separated "id" and "filename" pairs. Each filename should refer to the
+Sahara image of the specified Sahara image id.
+
+```bash
+qdl 13:prog_firehose_ddr.elf,42:the-answer rawprogram.xml
+```
+
+#### Sahara configuration XML file
+
+Flattened METAs include the various images that need to be loaded to
+enter Firehose mode, as well as a sahara_config XML file, which defines the
+Sahara image id for each of these images.
+
+If the specified device programmer is determined to be a Sahara configuration
+XML file, it will be parsed and the referenced files will be loaded and
+serviced to the device upon request.
+
+```bash
+qdl sahara_programmer.xml rawprogram.xml
+```
+
+#### Programmer archive
+
+Directly providing a list of ids and filenames is cumbersome and error-prone,
+so QDL accepts a "*programmer archive*". This allows the user to use the
+tool in the same fashion as was done for single-programmer targets.
+
+The *programmer archive* is a CPIO archive containing the Sahara images to be
+loaded, identified by the filename **id[:filename]** (*filename* is optional,
+but useful for debugging). Each included file will be used to serve requests
+for the given Sahara *id*.
+
+Such an archive can be created by putting the target's programmer images in an
+empty directory, then executing the following command from that directory:
+
+```bash
+ls | cpio -o -H newc > ../programmer.cpio
+```
+
+*programmer.cpio* can now be passed to QDL and the included images will be
+served in order to reach Firehose mode.
+
+## Run tests
+
+To run the integration test suite for QDL, use the `make tests` target:
+
+```bash
 make tests
+```
+
+## Generate man pages
+
+Manpages can be generated using `make manpages` target:
+
+```bash
+make manpages
+```
+
+## Contributing
+
+Please submit any patches to the qdl (`master` branch) by using the GitHub pull
+request feature. Fork the repo, create a branch, do the work, rebase with upstream,
+and submit the pull request.
+
+The preferred coding style for this tool is [Linux kernel coding style](https://www.kernel.org/doc/html/v6.15/process/coding-style.html).
+
+Before creating a commit, please ensure that your changes adhere to the coding style
+by using the `make check-cached` target, for example:
+
+```bash
+$ git status
+On branch improvements
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+  modified:   qdl.c
+  modified:   qdl.h
+
+$ make check-cached
+Running checkpatch on staged changes...
+ERROR: trailing whitespace
+#28: FILE: qdl.h:32:
++^IQDL_DEVICE_USB,   $
+
+total: 1 errors, 0 warnings, 0 checks, 27 lines checked
+
+NOTE: For some of the reported defects, checkpatch may be able to
+      mechanically convert to the typical style using --fix or --fix-inplace.
+
+NOTE: Whitespace errors detected.
+      You may wish to use scripts/cleanpatch or scripts/cleanfile
+
+Your patch has style problems, please review.
 ```
 
 ## License
 
-BSD 3-Clause. See [LICENSE](LICENSE). Fork of [linux-msm/qdl](https://github.com/linux-msm/qdl).
+This tool is licensed under the BSD 3-Clause license. Check out [LICENSE](LICENSE)
+for more details.

@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <unistd.h>
@@ -19,58 +18,6 @@
 #include "oscompat.h"
 #include "qdl.h"
 #include "version.h"
-
-/*
- * Normalize Windows-style paths to Unix-style.
- * Converts backslashes to forward slashes in-place.
- */
-void normalize_path(char *path)
-{
-	char *p;
-
-	if (!path)
-		return;
-
-	for (p = path; *p; p++) {
-		if (*p == '\\')
-			*p = '/';
-	}
-}
-
-/*
- * Create parent directories for the given file path.
- * Similar to "mkdir -p" for the directory portion of a path.
- */
-int mkpath(const char *file_path)
-{
-	char *path;
-	char *p;
-
-	if (!file_path)
-		return -1;
-
-	path = strdup(file_path);
-	if (!path)
-		return -1;
-
-	for (p = path + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-#ifdef _WIN32
-			if (mkdir(path) < 0 && errno != EEXIST) {
-#else
-			if (mkdir(path, 0755) < 0 && errno != EEXIST) {
-#endif
-				free(path);
-				return -1;
-			}
-			*p = '/';
-		}
-	}
-
-	free(path);
-	return 0;
-}
 
 static uint8_t to_hex(uint8_t ch)
 {
@@ -80,12 +27,9 @@ static uint8_t to_hex(uint8_t ch)
 
 void print_version(void)
 {
-	fprintf(stdout, "qfenix - Qualcomm Firehose / DIAG multi-tool\n");
-#ifdef BUILD_STATIC
-	fprintf(stdout, "%s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
-#else
-	fprintf(stdout, "%s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
-#endif
+	extern const char *__progname;
+
+	fprintf(stdout, "%s version %s\n", __progname, VERSION);
 }
 
 void print_hex_dump(const char *prefix, const void *buf, size_t len)
