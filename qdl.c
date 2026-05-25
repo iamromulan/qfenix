@@ -17,7 +17,12 @@
 #include <unistd.h>
 
 #include "qdl.h"
+#include "contents.h"
+#include "file.h"
+#include "firehose.h"
+#include "flashmap.h"
 #include "patch.h"
+#include "pathbuf.h"
 #include "program.h"
 #include "ufs.h"
 #include "oscompat.h"
@@ -38,6 +43,9 @@ enum {
 	QDL_FILE_CONTENTS,
 	QDL_CMD_READ,
 	QDL_CMD_WRITE,
+	QDL_CMD_ERASE,
+	QDL_CMD_FLASH,
+	QDL_CMD_SHA256,
 };
 
 bool qdl_debug;
@@ -53,6 +61,12 @@ static int detect_type(const char *verb)
 		return QDL_CMD_READ;
 	if (!strcmp(verb, "write"))
 		return QDL_CMD_WRITE;
+	if (!strcmp(verb, "erase"))
+		return QDL_CMD_ERASE;
+	if (!strcmp(verb, "flash"))
+		return QDL_CMD_FLASH;
+	if (!strcmp(verb, "sha256"))
+		return QDL_CMD_SHA256;
 
 	if (access(verb, F_OK)) {
 		ux_err("%s is not a verb and not a XML file\n", verb);
@@ -94,22 +108,34 @@ static int detect_type(const char *verb)
 	return type;
 }
 
-static enum qdl_storage_type decode_storage(const char *storage)
+/*
+ * Parse a --backend= value into an enum. "auto" maps to the meta-backend
+ * QDL_DEVICE_AUTO, which inside its open path runs a unified wait loop
+ * over libusb and (on Windows) the QUD SetupAPI enumeration, binding
+ * whichever first reaches an EDL device. Explicit "usb"/"qud" pin to a
+ * single concrete transport and skip the meta layer entirely.
+ *
+ * QDL_DEVICE_SIM is intentionally not selectable via --backend; --dry-run /
+ * --create-digests pick it implicitly.
+ */
+static int decode_backend(const char *name, enum QDL_DEVICE_TYPE *out)
 {
+	if (!name || !strcmp(name, "auto")) {
+		*out = QDL_DEVICE_AUTO;
+		return 0;
+	}
 
-	if (!strcmp(storage, "emmc"))
-		return QDL_STORAGE_EMMC;
-	if (!strcmp(storage, "nand"))
-		return QDL_STORAGE_NAND;
-	if (!strcmp(storage, "nvme"))
-		return QDL_STORAGE_NVME;
-	if (!strcmp(storage, "spinor"))
-		return QDL_STORAGE_SPINOR;
-	if (!strcmp(storage, "ufs"))
-		return QDL_STORAGE_UFS;
+	if (!strcmp(name, "usb")) {
+		*out = QDL_DEVICE_USB;
+		return 0;
+	}
 
-	fprintf(stderr, "Unknown storage type \"%s\"\n", storage);
-	exit(1);
+	if (!strcmp(name, "qud")) {
+		*out = QDL_DEVICE_QUD;
+		return 0;
+	}
+
+	return -1;
 }
 
 #define CPIO_MAGIC "070701"
@@ -198,7 +224,7 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 		}
 
 		if (namesize > sizeof(name)) {
-			ux_err("unexpected filename length in progammer archive\n");
+			ux_err("unexpected filename length in programmer archive\n");
 			goto err;
 		}
 		memcpy(name, ptr, namesize);
@@ -207,6 +233,10 @@ static int decode_programmer_archive(struct sahara_image *blob, struct sahara_im
 			break;
 
 		tok = strtok_r(name, ":", &save);
+		if (!tok) {
+			ux_err("missing image id in programmer archive entry\n");
+			goto err;
+		}
 		id = strtoul(tok, NULL, 0);
 		if (id == 0 || id >= MAPPING_SZ) {
 			ux_err("invalid image id \"%s\" in programmer archive\n", tok);
@@ -255,9 +285,11 @@ err:
  *
  * Returns: 0 if no archive was found, 1 if archive was decoded, -1 on error
  */
-static int decode_sahara_config(struct sahara_image *blob, struct sahara_image *images)
+int decode_sahara_config(struct sahara_image *blob, struct sahara_image *images,
+			 struct contents_filter *contents_filter)
 {
 	char image_path_full[PATH_MAX];
+	struct pathbuf image_full_path = {};
 	const char *image_path;
 	unsigned int image_id;
 	size_t image_path_len;
@@ -316,19 +348,29 @@ static int decode_sahara_config(struct sahara_image *blob, struct sahara_image *
 		}
 
 		image_path_len = strlen(image_path);
-		if (base_path_len + 1 + image_path_len + 1 > PATH_MAX) {
-			free((void *)image_path);
-			goto err_free_doc;
-		}
 
-		memcpy(image_path_full, base_path, base_path_len);
-		image_path_full[base_path_len] = '/';
-		memcpy(image_path_full + base_path_len + 1, image_path, image_path_len);
-		image_path_full[base_path_len + 1 + image_path_len] = '\0';
+		if (contents_resolve_path(contents_filter, image_path, &image_full_path) == 1) {
+			memcpy(image_path_full, image_full_path.buf, image_full_path.len + 1);
+		} else if (path_is_absolute(image_path)) {
+			if (image_path_len + 1 > PATH_MAX) {
+				free((void *)image_path);
+				goto err_free_doc;
+			}
+			memcpy(image_path_full, image_path, image_path_len + 1);
+		} else {
+			if (base_path_len + 1 + image_path_len + 1 > PATH_MAX) {
+				free((void *)image_path);
+				goto err_free_doc;
+			}
+			memcpy(image_path_full, base_path, base_path_len);
+			image_path_full[base_path_len] = '/';
+			memcpy(image_path_full + base_path_len + 1, image_path, image_path_len);
+			image_path_full[base_path_len + 1 + image_path_len] = '\0';
+		}
 
 		free((void *)image_path);
 
-		ret = load_sahara_image(image_path_full, &images[image_id]);
+		ret = load_sahara_image(NULL, image_path_full, &images[image_id]);
 		if (ret < 0)
 			goto err_free_doc;
 	}
@@ -357,11 +399,11 @@ err_free_doc:
  * @s: programmer specifier, from the user
  * @images: array of images to populate
  *
- * This parses the progammer specifier @s, which can either be a single
+ * This parses the programmer specifier @s, which can either be a single
  * filename, or a comma-separated series of <id>:<filename> entries.
  *
  * In the first case an attempt will be made to decode the Sahara archive and
- * each programmer part will be loaded into their requestd @images entry. If
+ * each programmer part will be loaded into their requested @images entry. If
  * the file isn't an archive @images[SAHARA_ID_EHOSTDL_IMG] is assigned. In the
  * second case, each comma-separated entry will be split on ':' and the given
  * <filename> will be assigned to the @image entry indicated by the given <id>.
@@ -397,12 +439,12 @@ static int decode_programmer(char *s, struct sahara_image *images)
 			}
 
 			filename = &tail[1];
-			ret = load_sahara_image(filename, &images[id]);
+			ret = load_sahara_image(NULL, filename, &images[id]);
 			if (ret < 0)
 				return -1;
 		}
 	} else {
-		ret = load_sahara_image(s, &archive);
+		ret = load_sahara_image(NULL, s, &archive);
 		if (ret < 0)
 			return -1;
 
@@ -410,7 +452,7 @@ static int decode_programmer(char *s, struct sahara_image *images)
 		if (ret < 0 || ret == 1)
 			return ret;
 
-		ret = decode_sahara_config(&archive, images);
+		ret = decode_sahara_config(&archive, images, NULL);
 		if (ret < 0 || ret == 1)
 			return ret;
 
@@ -426,8 +468,12 @@ static void print_usage(FILE *out)
 
 	fprintf(out, "Usage: %s [options] <prog.mbn> (<program-xml> | <patch-xml> | <read-xml>)...\n", __progname);
 	fprintf(out, "       %s [options] <prog.mbn> ((read | write) <address> <binary>)...\n", __progname);
+	fprintf(out, "       %s [options] <prog.mbn> (erase <address>)...\n", __progname);
+	fprintf(out, "       %s [options] <prog.mbn> (sha256 <address>)...\n", __progname);
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
+	fprintf(out, "       %s flash (<flashmap>[::specifier] | <contents>[::<specifier>])\n", __progname);
+	fprintf(out, "       %s create-zip <zipfile> <contents>[::<specifier>]\n", __progname);
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
 	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
@@ -440,6 +486,10 @@ static void print_usage(FILE *out)
 	fprintf(out, " -t, --create-digests=T\t\tGenerate table of digests in the T folder\n");
 	fprintf(out, " -T, --slot=T\t\t\tSet slot number T for multiple storage devices\n");
 	fprintf(out, " -D, --vip-table-path=T\t\tUse digest tables in the T folder for VIP\n");
+	fprintf(out, " -R, --skip-reset\t\tDo not send the reset command after flashing completes\n");
+	fprintf(out, "     --backend=B\t\tSelect device backend B: <auto|usb|qud> (default: auto)\n");
+	fprintf(out, "     --skipblock=M\t\tUse readback mechanism M to skip <program> entries already on flash;\n");
+	fprintf(out, "                 \t\tM: <none|sha256> (default: none)\n");
 	fprintf(out, " -h, --help\t\t\tPrint this usage info\n");
 	fprintf(out, " <program-xml>\t\txml file containing <program> or <erase> directives\n");
 	fprintf(out, " <patch-xml>\t\txml file containing <patch> directives\n");
@@ -449,32 +499,50 @@ static void print_usage(FILE *out)
 	fprintf(out, "          \t\tnumber S, the number of sectors to follow L, or partition by \"name\"\n");
 	fprintf(out, " <ramdump-path>\t\tpath where ramdump should stored\n");
 	fprintf(out, " <segment-filter>\toptional glob-pattern to select which segments to ramdump\n");
+	fprintf(out, " <flashmap>\tflashmap JSON file, or ZIP archive with flashmap.json\n");
+	fprintf(out, " <contents>\tcontents XML file\n");
+	fprintf(out, " <specifier>\tcomma-separated list of specifiers, such as storage type and flavors\n");
 	fprintf(out, "\n");
 	fprintf(out, "Example: %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
+	fprintf(out, "         %s flash contents.xml::ufs,spinor/safe_rtos\n", __progname);
 }
 
 static int qdl_list(FILE *out)
 {
-	struct qdl_device_desc *devices;
-	unsigned int count;
+	struct qdl_device_desc *usb_devices;
+	struct qud_device_desc *qud_devices;
+	unsigned int usb_count = 0;
+	unsigned int qud_count = 0;
 	unsigned int i;
 
-	devices = usb_list(&count);
-	if (!devices)
-		return 1;
+	usb_devices = usb_list(&usb_count);
+	qud_devices = qud_list(&qud_count);
 
-	if (count == 0) {
+	if (usb_count == 0 && qud_count == 0) {
 		fprintf(out, "No devices found\n");
 	} else {
-		for (i = 0; i < count; i++)
+		for (i = 0; i < usb_count; i++)
 			fprintf(out, "%04x:%04x\t%s\n",
-				devices[i].vid, devices[i].pid, devices[i].serial);
+				usb_devices[i].vid, usb_devices[i].pid,
+				usb_devices[i].serial);
+		for (i = 0; i < qud_count; i++)
+			fprintf(out, "05c6:%04x\t%s\t%s\n",
+				qud_devices[i].pid,
+				qud_devices[i].serial,
+				qud_devices[i].path);
 	}
 
-	free(devices);
+	free(usb_devices);
+	free(qud_devices);
 
 	return 0;
 }
+
+/* Long-only option ids, distinct from any short option character. */
+enum {
+	OPT_BACKEND = 0x100,
+	OPT_SKIPBLOCK,
+};
 
 static int qdl_ramdump(int argc, char **argv)
 {
@@ -482,6 +550,7 @@ static int qdl_ramdump(int argc, char **argv)
 	char *ramdump_path = ".";
 	char *filter = NULL;
 	char *serial = NULL;
+	enum QDL_DEVICE_TYPE qdl_dev_type = QDL_DEVICE_AUTO;
 	int ret = 0;
 	int opt;
 
@@ -490,6 +559,7 @@ static int qdl_ramdump(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{"output", required_argument, 0, 'o'},
 		{"serial", required_argument, 0, 'S'},
+		{"backend", required_argument, 0, OPT_BACKEND},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
@@ -507,6 +577,10 @@ static int qdl_ramdump(int argc, char **argv)
 			break;
 		case 'S':
 			serial = optarg;
+			break;
+		case OPT_BACKEND:
+			if (decode_backend(optarg, &qdl_dev_type) < 0)
+				errx(1, "unknown backend \"%s\" (expected auto|usb|qud)", optarg);
 			break;
 		case 'h':
 			print_usage(stdout);
@@ -527,9 +601,11 @@ static int qdl_ramdump(int argc, char **argv)
 
 	ux_init();
 
-	qdl = qdl_init(QDL_DEVICE_USB);
-	if (!qdl)
+	qdl = qdl_init(qdl_dev_type);
+	if (!qdl) {
+		ux_err("backend not available\n");
 		return 1;
+	}
 
 	if (qdl_debug)
 		print_version();
@@ -553,10 +629,230 @@ out_cleanup:
 	return ret;
 }
 
+static int qdl_ensure_configured(struct list_head *ops, enum qdl_storage_type storage_type)
+{
+	struct firehose_op *op;
+
+	if (list_empty(ops))
+		return 0;
+
+	op = list_entry_first(ops, struct firehose_op, node);
+	if (op->type == FIREHOSE_OP_CONFIGURE)
+		return 0;
+
+	op = firehose_alloc_op(FIREHOSE_OP_CONFIGURE);
+	if (!op)
+		return -1;
+
+	op->storage_type = storage_type;
+
+	list_prepend(ops, &op->node);
+
+	return 0;
+}
+
+static char *qdl_split_specifier(const char *param, char **specifier)
+{
+	char *filename;
+	char *tmp;
+
+	if (!param || !param[0])
+		return NULL;
+
+	filename = strdup(param);
+	if (!filename) {
+		ux_err("internal error: unable to allocate memory for argument\n");
+		return NULL;
+	}
+
+	*specifier = NULL;
+
+	tmp = strstr(filename, "::");
+	if (tmp) {
+		if (strstr(tmp + 2, "::")) {
+			free(filename);
+			return NULL;
+		}
+
+		*tmp = '\0';
+		if (!filename[0] || !tmp[2]) {
+			free(filename);
+			return NULL;
+		}
+
+		*specifier = tmp + 2;
+	}
+
+	return filename;
+}
+
+static int qdl_cmd_flash(struct list_head *firehose_ops, const char *arg,
+			 const char *incdir, struct sahara_image *images)
+{
+	struct qdl_file flashmap;
+	struct qdl_zip *zip = NULL;
+	const char *dot;
+	char *specifier;
+	char *filename;
+	char *tmp;
+	char *base;
+	int file_type = QDL_FILE_UNKNOWN;
+	int ret;
+
+	filename = qdl_split_specifier(arg, &specifier);
+	if (!filename) {
+		ux_err("failed to parse flash argument \"%s\" (expected <file> or <file>::<selector>)\n",
+		       arg);
+		return -1;
+	}
+
+	tmp = strdup(filename);
+	if (!tmp)
+		return -1;
+
+	base = basename(tmp);
+	dot = strrchr(base, '.');
+
+	if (dot && !strcmp(dot, ".xml")) {
+		file_type = QDL_FILE_CONTENTS;
+	} else if (dot && !strcmp(dot, ".json")) {
+		file_type = QDL_CMD_FLASH;
+	} else {
+		ret = qdl_zip_open(filename, &zip);
+		if (!ret) {
+			ret = qdl_file_open(zip, "flashmap.json", &flashmap);
+			if (!ret) {
+				qdl_file_close(&flashmap);
+				file_type = QDL_CMD_FLASH;
+			}
+			qdl_zip_put(zip);
+		}
+	}
+	free(tmp);
+
+	switch (file_type) {
+	case QDL_FILE_CONTENTS:
+		ret = contents_load(firehose_ops, filename, specifier, images, incdir);
+		break;
+	case QDL_CMD_FLASH:
+		ret = flashmap_load(firehose_ops, filename, specifier, images, incdir);
+		break;
+	default:
+		ux_err("flash input must be contents.xml, flashmap.json, or a zip containing flashmap.json\n");
+		ret = -1;
+		break;
+	}
+
+	free(filename);
+
+	return ret;
+}
+
+static int qdl_create_zip(int argc, char **argv)
+{
+	struct sahara_image images[MAPPING_SZ] = {};
+	struct list_head ops = LIST_INIT(ops);
+	const char *zipfile = argv[1];
+	char *specifier;
+	char *filename;
+	int ret;
+
+	if (argc != 3) {
+		print_usage(stderr);
+		return 1;
+	}
+
+	ux_init();
+
+	filename = qdl_split_specifier(argv[2], &specifier);
+	if (!filename) {
+		ux_err("failed to parse flash argument");
+		return 1;
+	}
+
+	ret = contents_load(&ops, filename, specifier, images, NULL);
+	if (ret < 0)
+		goto out_free_filename;
+
+	ret = zipper_write(zipfile, &ops, images);
+
+	sahara_images_free(images, MAPPING_SZ);
+	firehose_free_ops(&ops);
+
+out_free_filename:
+	free(filename);
+
+	return ret ? 1 : 0;
+}
+
+static int qdl_determine_bootable(struct list_head *ops)
+{
+	struct firehose_op *op;
+	bool multiple;
+	int bootable;
+
+	bootable = program_find_bootable_partition(ops, &multiple);
+	if (bootable < 0) {
+		ux_debug("no boot partition found\n");
+		return 0;
+	}
+
+	if (multiple)
+		ux_info("Multiple candidates for primary bootloader found, using partition %d\n",
+			bootable);
+
+	op = firehose_alloc_op(FIREHOSE_OP_SET_BOOTABLE);
+	if (!op)
+		return -1;
+
+	op->partition = bootable;
+
+	list_append(ops, &op->node);
+
+	return 0;
+}
+
+/*
+ * Walk the firehose op list and emit one hex line per
+ * FIREHOSE_OP_GET_SHA256_DIGEST entry. firehose_run() fills op->digest;
+ * formatting and printing live here so firehose.c stays out of the
+ * user-facing output policy.
+ *
+ * If the request shipped but the device returned no digest
+ * (digest_valid stayed false), surface that to the user instead of
+ * silently skipping the region.
+ */
+static void print_sha256_results(struct list_head *ops)
+{
+	struct firehose_op *op;
+
+	list_for_each_entry(op, ops, node) {
+		char hex[SHA256_DIGEST_STRING_LENGTH];
+		size_t i;
+
+		if (op->type != FIREHOSE_OP_GET_SHA256_DIGEST)
+			continue;
+
+		if (!op->digest_valid) {
+			ux_err("no sha256 digest returned for %s+0x%x\n",
+			       op->start_sector, op->num_sectors);
+			continue;
+		}
+
+		for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
+			snprintf(hex + i * 2, 3, "%02x", op->digest[i]);
+		hex[SHA256_DIGEST_STRING_LENGTH - 1] = '\0';
+
+		printf("%s\n", hex);
+		fflush(stdout);
+	}
+}
+
 static int qdl_flash(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct sahara_image sahara_images[MAPPING_SZ] = {};
+	struct list_head firehose_ops = LIST_INIT(firehose_ops);
 	char *incdir = NULL;
 	char *serial = NULL;
 	const char *vip_generate_dir = NULL;
@@ -567,10 +863,12 @@ static int qdl_flash(int argc, char **argv)
 	bool qdl_finalize_provisioning = false;
 	bool allow_fusing = false;
 	bool allow_missing = false;
+	bool skip_reset = false;
 	long out_chunk_size = 0;
 	unsigned int slot = UINT_MAX;
 	struct qdl_device *qdl = NULL;
-	enum QDL_DEVICE_TYPE qdl_dev_type = QDL_DEVICE_USB;
+	enum QDL_DEVICE_TYPE qdl_dev_type = QDL_DEVICE_AUTO;
+	enum qdl_skipblock_mode skipblock_mode = QDL_SKIPBLOCK_NONE;
 
 	static struct option options[] = {
 		{"debug", no_argument, 0, 'd'},
@@ -586,11 +884,14 @@ static int qdl_flash(int argc, char **argv)
 		{"dry-run", no_argument, 0, 'n'},
 		{"create-digests", required_argument, 0, 't'},
 		{"slot", required_argument, 0, 'T'},
+		{"skip-reset", no_argument, 0, 'R'},
+		{"backend", required_argument, 0, OPT_BACKEND},
+		{"skipblock", required_argument, 0, OPT_SKIPBLOCK},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:Rh", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -622,7 +923,9 @@ static int qdl_flash(int argc, char **argv)
 			out_chunk_size = strtol(optarg, NULL, 10);
 			break;
 		case 's':
-			storage_type = decode_storage(optarg);
+			storage_type = decode_storage_type(optarg);
+			if (storage_type == QDL_STORAGE_UNKNOWN)
+				errx(1, "unknown storage type \"%s\"", optarg);
 			break;
 		case 'S':
 			serial = optarg;
@@ -632,6 +935,27 @@ static int qdl_flash(int argc, char **argv)
 			break;
 		case 'T':
 			slot = (unsigned int)strtoul(optarg, NULL, 10);
+			break;
+		case 'R':
+			skip_reset = true;
+			break;
+		case OPT_BACKEND:
+			/*
+			 * --dry-run / --create-digests already pinned the backend to
+			 * QDL_DEVICE_SIM; honour that and ignore --backend in that case.
+			 */
+			if (qdl_dev_type != QDL_DEVICE_SIM &&
+			    decode_backend(optarg, &qdl_dev_type) < 0)
+				errx(1, "unknown backend \"%s\" (expected auto|usb|qud)", optarg);
+			break;
+		case OPT_SKIPBLOCK:
+			if (!strcmp(optarg, "none"))
+				skipblock_mode = QDL_SKIPBLOCK_NONE;
+			else if (!strcmp(optarg, "sha256"))
+				skipblock_mode = QDL_SKIPBLOCK_SHA256;
+			else
+				errx(1, "unknown --skipblock mode \"%s\", valid options are none and sha256",
+				     optarg);
 			break;
 		case 'h':
 			print_usage(stdout);
@@ -655,6 +979,7 @@ static int qdl_flash(int argc, char **argv)
 	}
 
 	qdl->slot = slot;
+	qdl->skipblock_mode = skipblock_mode;
 
 	if (vip_table_path) {
 		if (vip_generate_dir)
@@ -678,9 +1003,15 @@ static int qdl_flash(int argc, char **argv)
 	if (qdl_debug)
 		print_version();
 
-	ret = decode_programmer(argv[optind++], sahara_images);
-	if (ret < 0)
-		exit(1);
+	/*
+	 * The programmer needs to either be selected explicitly or through the
+	 * "flash" subcommand. Handling of "flash" happens in the loop below.
+	 */
+	if (strcmp(argv[optind], "flash")) {
+		ret = decode_programmer(argv[optind++], sahara_images);
+		if (ret < 0)
+			goto out_cleanup;
+	}
 
 	do {
 		type = detect_type(argv[optind]);
@@ -689,21 +1020,23 @@ static int qdl_flash(int argc, char **argv)
 
 		switch (type) {
 		case QDL_FILE_PATCH:
-			ret = patch_load(argv[optind]);
+			ret = patch_load(&firehose_ops, argv[optind]);
 			if (ret < 0)
 				errx(1, "patch_load %s failed", argv[optind]);
 			break;
 		case QDL_FILE_PROGRAM:
-			ret = program_load(argv[optind], storage_type == QDL_STORAGE_NAND, allow_missing, incdir);
+			ret = program_load(&firehose_ops, argv[optind],
+					   storage_type == QDL_STORAGE_NAND,
+					   allow_missing, NULL, incdir);
 			if (ret < 0)
 				errx(1, "program_load %s failed", argv[optind]);
 
-			if (!allow_fusing && program_is_sec_partition_flashed())
+			if (!allow_fusing && program_is_sec_partition_flashed(&firehose_ops))
 				errx(1, "secdata partition to be programmed, which can lead to irreversible"
 					" changes. Allow explicitly with --allow-fusing parameter");
 			break;
 		case QDL_FILE_READ:
-			ret = read_op_load(argv[optind], incdir);
+			ret = read_op_load(&firehose_ops, argv[optind], incdir);
 			if (ret < 0)
 				errx(1, "read_op_load %s failed", argv[optind]);
 			break;
@@ -718,7 +1051,7 @@ static int qdl_flash(int argc, char **argv)
 		case QDL_CMD_READ:
 			if (optind + 2 >= argc)
 				errx(1, "read command missing arguments");
-			ret = read_cmd_add(argv[optind + 1], argv[optind + 2]);
+			ret = read_cmd_add(&firehose_ops, argv[optind + 1], argv[optind + 2]);
 			if (ret < 0)
 				errx(1, "failed to add read command");
 			optind += 2;
@@ -726,10 +1059,34 @@ static int qdl_flash(int argc, char **argv)
 		case QDL_CMD_WRITE:
 			if (optind + 2 >= argc)
 				errx(1, "write command missing arguments");
-			ret = program_cmd_add(argv[optind + 1], argv[optind + 2]);
+			ret = program_cmd_add(&firehose_ops, argv[optind + 1], argv[optind + 2]);
 			if (ret < 0)
 				errx(1, "failed to add write command");
 			optind += 2;
+			break;
+		case QDL_CMD_ERASE:
+			if (optind + 1 >= argc)
+				errx(1, "erase command missing address");
+			ret = erase_cmd_add(&firehose_ops, argv[optind + 1]);
+			if (ret < 0)
+				errx(1, "failed to add erase command");
+			optind += 1;
+			break;
+		case QDL_CMD_SHA256:
+			if (optind + 1 >= argc)
+				errx(1, "sha256 command missing address");
+			ret = sha256_cmd_add(&firehose_ops, argv[optind + 1]);
+			if (ret < 0)
+				errx(1, "failed to add sha256 command");
+			optind += 1;
+			break;
+		case QDL_CMD_FLASH:
+			if (optind + 1 >= argc)
+				errx(1, "flash command missing operands");
+			ret = qdl_cmd_flash(&firehose_ops, argv[optind + 1], incdir, sahara_images);
+			if (ret < 0)
+				goto out_cleanup;
+			optind += 1;
 			break;
 		default:
 			errx(1, "%s type not yet supported", argv[optind]);
@@ -737,48 +1094,82 @@ static int qdl_flash(int argc, char **argv)
 		}
 	} while (++optind < argc);
 
-	ret = qdl_open(qdl, serial);
+	ret = qdl_ensure_configured(&firehose_ops, storage_type);
+	if (ret < 0)
+		goto out_cleanup;
+
+	ret = qdl_determine_bootable(&firehose_ops);
 	if (ret)
 		goto out_cleanup;
 
-	qdl->storage_type = storage_type;
+	/*
+	 * Reset is the last operation in any flashing run, modelled as a regular
+	 * firehose op so callers can compose it like any other. Skip the append
+	 * to leave the programmer alive across qdl invocations.
+	 */
+	if (!skip_reset) {
+		struct firehose_op *reset_op = firehose_alloc_op(FIREHOSE_OP_RESET);
+
+		if (!reset_op) {
+			ret = -1;
+			goto out_cleanup;
+		}
+		list_append(&firehose_ops, &reset_op->node);
+	}
+
+	ret = qdl_open(qdl, serial);
+	if (ret)
+		goto out_cleanup;
 
 	ret = sahara_run(qdl, sahara_images, NULL, NULL);
 	if (ret < 0)
 		goto out_cleanup;
 
 	if (ufs_need_provisioning())
-		ret = firehose_provision(qdl);
+		ret = firehose_provision(qdl, skip_reset);
 	else
-		ret = firehose_run(qdl);
+		ret = firehose_run(qdl, &firehose_ops);
 	if (ret < 0)
 		goto out_cleanup;
 
-out_cleanup:
-	if (vip_generate_dir)
-		vip_gen_finalize(qdl);
+	print_sha256_results(&firehose_ops);
 
-	qdl_close(qdl);
+out_cleanup:
+	if (qdl) {
+		if (vip_generate_dir)
+			vip_gen_finalize(qdl);
+
+		qdl_close(qdl);
+	}
 
 	sahara_images_free(sahara_images, MAPPING_SZ);
 
-	free_programs();
-	free_patches();
+	firehose_free_ops(&firehose_ops);
 
-	if (qdl->vip_data.state != VIP_DISABLED)
-		vip_transfer_deinit(qdl);
+	if (qdl) {
+		if (qdl->vip_data.state != VIP_DISABLED)
+			vip_transfer_deinit(qdl);
 
-	qdl_deinit(qdl);
+		qdl_deinit(qdl);
+	}
 
 	return !!ret;
 }
 
 int main(int argc, char **argv)
 {
-	if (argc == 2 && !strcmp(argv[1], "list"))
-		return qdl_list(stdout);
-	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
-		return qdl_ramdump(argc - 1, argv + 1);
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "list"))
+			return qdl_list(stdout);
+		if (!strcmp(argv[i], "ramdump"))
+			return qdl_ramdump(argc - i, argv + i);
+		if (!strcmp(argv[i], "create-zip"))
+			return qdl_create_zip(argc - i, argv + i);
+		if (argv[i][0] != '-')
+			break;
+	}
 
 	return qdl_flash(argc, argv);
 }

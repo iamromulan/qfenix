@@ -11,8 +11,9 @@ IDs `9008`, `900e`, `901d`) to upload a flash loader and use it to flash images.
 ### Linux
 
 ```bash
-sudo apt install libxml2-dev libusb-1.0-0-dev help2man
-make
+sudo apt install libxml2-dev libusb-1.0-0-dev libzip-dev meson ninja-build help2man
+meson setup build
+meson compile -C build
 ```
 
 ### MacOS
@@ -20,15 +21,17 @@ make
 For Homebrew users:
 
 ```bash
-brew install libxml2 pkg-config libusb help2man
-make
+brew install libxml2 libusb libzip meson ninja help2man
+meson setup build
+meson compile -C build
 ```
 
 For MacPorts users:
 
 ```bash
-sudo port install libxml2 pkgconfig libusb help2man
-make
+sudo port install libxml2 libusb libzip meson ninja help2man
+meson setup build
+meson compile -C build
 ```
 
 ### Windows
@@ -42,16 +45,18 @@ pacman -S base-devel --needed
 pacman -S git
 pacman -S help2man
 pacman -S mingw-w64-x86_64-gcc
-pacman -S mingw-w64-x86_64-make
-pacman -S mingw-w64-x86_64-pkg-config
+pacman -S mingw-w64-x86_64-meson
+pacman -S mingw-w64-x86_64-ninja
 pacman -S mingw-w64-x86_64-libusb
 pacman -S mingw-w64-x86_64-libxml2
+pacman -S mingw-w64-x86_64-libzip
 ```
 
-Then use the `make` tool to build QDL:
+Then use the `meson` tool to build QDL:
 
 ```bash
-make
+meson setup build
+meson compile -C build
 ```
 
 ## Use QDL
@@ -82,6 +87,48 @@ the board to flash through the `--serial` option:
 ```bash
 qdl --serial=0AA94EFD prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 ```
+
+### Flashing installer packages
+
+If you have an installer package instead of individual binaries and XML
+definitions, you can flash this using the *flash* subcommand:
+
+```bash
+qdl flash <installer.zip>
+```
+
+If the *installer package* is unpacked it can be installed as:
+
+```bash
+qdl flash flashmap.json
+```
+
+These can of course be combined with e.g. *--serial*.
+
+A subset of the installer package can be selected for installation by appending
+a **::storage1[,storage2...]** suffix to the file name.
+
+### Flashing contents.xml
+
+QDL also supports flashing builds described by *contents.xml* files:
+
+```bash
+qdl flash contents.xml
+```
+
+As the contents XML can describe the content for multiple storage types and
+multiple flavors, it might be necessary to select which content to flash. This
+is done by appending the **::specifier1,specifier2...** suffix to the file
+name. The specifier is matched against **storage types** and **flavors**. At
+most one resolved specifier per storage is allowed, and only the selected parts
+are flashed. As an example:
+
+```bash
+qdl flash contents.xml::ufs,safe_rtos
+```
+
+will flash the UFS storage with the only applicable flavor, and will flash
+*safe_rtos* onto the spinor.
 
 ### Flash simulation (dry run)
 
@@ -176,6 +223,24 @@ qdl --vip-table-path=./vip prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 
 Note that `--vip-table-path` and `--create-digests` are mutually exclusive.
 
+#### Validating VIP tables without hardware
+
+Before flashing a real device it is possible to verify that the signed digest
+tables match the data that will be sent, using `--dry-run` together with
+`--vip-table-path`:
+
+```bash
+qdl --dry-run --vip-table-path=./vip prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+```
+
+QDL will simulate the full Firehose session, compute SHA256 over every packet
+it would send, and compare each hash against the corresponding entry in the
+loaded digest tables. Any mismatch is reported to stderr. All mismatches are
+printed before the run exits so that every problem is visible at once.
+
+This catches table/data mismatches early -- before committing to a real flash --
+and is useful both as a local sanity check and as a step in CI pipelines.
+
 ### Multi-programmer targets
 
 On some targets multiple files need to be loaded in order to reach the
@@ -227,20 +292,91 @@ ls | cpio -o -H newc > ../programmer.cpio
 *programmer.cpio* can now be passed to QDL and the included images will be
 served in order to reach Firehose mode.
 
-## Run tests
+## Collect crash dump
 
-To run the integration test suite for QDL, use the `make tests` target:
+When a Qualcomm target crashes or is forced into crash dump mode, the
+bootloader re-enumerates the device over USB with Product ID `900e` and
+offers memory segments for collection via the Sahara protocol.
+
+A kernel crash can be triggered on the target with:
 
 ```bash
-make tests
+echo c > /proc/sysrq-trigger
+```
+
+Use `qdl ramdump` on the host to collect the dump:
+
+```bash
+qdl ramdump -o ./ramdump
+```
+
+The same functionality is also available as a standalone `qdl-ramdump`
+binary, useful when only crash-dump collection is needed:
+
+```bash
+qdl-ramdump -o ./ramdump
+```
+
+Either form writes each offered memory segment to a separate file under
+`./ramdump`. To collect only specific segments, pass a comma-separated
+filter:
+
+```bash
+qdl ramdump -o ./ramdump OCIMEM,CODERAM
+```
+
+## Sahara kickstart for flashless-boot devices (qdl-ks)
+
+The `qdl-ks` ("kickstart") helper uses the Sahara protocol to load
+images from the host to the device. It targets *flashless boot* devices
+such as the Qualcomm Cloud AI 100, which fetch their runtime firmware
+from the host on every boot rather than storing it on-device.
+
+Although it shares the Sahara protocol with `qdl`, `qdl-ks` is a
+deliberately separate tool: it does not use USB or Firehose, and instead
+talks to a kernel-provided device node using plain open/read/write
+operations. Its argument set is correspondingly minimal.
+
+Two arguments are required: `-p` selects the Sahara port (a device node)
+and `-s id:path` registers an image mapping. The `-s` option may be
+specified more than once, one mapping per Sahara image id the device may
+request.
+
+```bash
+qdl-ks -p /dev/mhi0_QAIC_SAHARA \
+       -s 1:/opt/qti-aic/firmware/fw1.bin \
+       -s 2:/opt/qti-aic/firmware/fw2.bin
+```
+
+The mapped files do not need to exist at invocation time. If `qdl-ks`
+cannot open a requested file, the device decides the next action. This
+makes it possible to wire `qdl-ks` into a single udev rule that covers
+multiple device configurations (for example, an optional DDR training
+image that is only present on some setups).
+
+## Run tests
+
+To run the integration test suite for QDL, use the `meson` tool with `test`
+param:
+
+```bash
+meson test -C build
+```
+
+If `cmocka` is installed at configure time, Meson also builds and runs the
+unit test suite (including `program_load_xml` path-resolution tests). You can
+run only unit tests with:
+
+```bash
+meson test -C build --suite unit
 ```
 
 ## Generate man pages
 
-Manpages can be generated using `make manpages` target:
+Manpages can be generated using `manpages` target:
 
 ```bash
-make manpages
+meson compile manpages -C build
 ```
 
 ## Contributing
@@ -252,7 +388,7 @@ and submit the pull request.
 The preferred coding style for this tool is [Linux kernel coding style](https://www.kernel.org/doc/html/v6.15/process/coding-style.html).
 
 Before creating a commit, please ensure that your changes adhere to the coding style
-by using the `make check-cached` target, for example:
+by using the `meson compile check-cached -C build` target, for example:
 
 ```bash
 $ git status
@@ -262,7 +398,8 @@ Changes to be committed:
   modified:   qdl.c
   modified:   qdl.h
 
-$ make check-cached
+$ meson compile check-cached -C build
+[0/1] Running external command check-cached (wrapped by meson to set env)
 Running checkpatch on staged changes...
 ERROR: trailing whitespace
 #28: FILE: qdl.h:32:
@@ -278,6 +415,41 @@ NOTE: Whitespace errors detected.
 
 Your patch has style problems, please review.
 ```
+
+To verify a series of commits the same way the CI does (per-commit, in
+patch mode), use the `check-range` target. It runs checkpatch on every
+commit in `$CHECKPATCH_BASE..$CHECKPATCH_HEAD` (defaulting to
+`origin/master..HEAD`):
+
+```bash
+meson compile check-range -C build
+```
+
+To restrict the range explicitly, set the environment variables before
+invoking meson:
+
+```bash
+CHECKPATCH_BASE=origin/master CHECKPATCH_HEAD=HEAD \
+    meson compile check-range -C build
+```
+
+The full file-mode check (run against every tracked C/H/sh source) is
+also available:
+
+```bash
+meson compile check -C build
+```
+
+Markdown sources are linted with
+[mdl](https://github.com/markdownlint/markdownlint). Install it via
+`sudo apt install markdownlint` (or `gem install mdl`) and run:
+
+```bash
+meson compile markdown-lint -C build
+```
+
+The wrapper script is invoked from the GitHub Actions workflow as well,
+so a green local run reflects what CI will report.
 
 ## License
 

@@ -4,7 +4,6 @@
 
 #ifdef _WIN32
 #include <malloc.h>
-#define alloca _alloca
 #else
 #include <alloca.h>
 #endif
@@ -41,13 +40,22 @@
 		(__typeof__(p))(((uintptr_t)(p) + _mask) & ~_mask);	\
 })
 
-#define MAPPING_SZ 64
+#define MAPPING_SZ 128
 
 #define SAHARA_ID_EHOSTDL_IMG	13
 
 enum QDL_DEVICE_TYPE {
 	QDL_DEVICE_USB,
 	QDL_DEVICE_SIM,
+	QDL_DEVICE_QUD,
+	/*
+	 * Meta-backend: defers transport selection to the wait loop inside
+	 * auto_open(), which polls libusb and (on Windows) the QUD SetupAPI
+	 * enumeration each tick and binds whichever first reaches an EDL
+	 * device. Resolves the UX hazard of an upfront probe timeout where
+	 * the user plugs in the cable just after the grace window expires.
+	 */
+	QDL_DEVICE_AUTO,
 };
 
 enum qdl_storage_type {
@@ -59,12 +67,18 @@ enum qdl_storage_type {
 	QDL_STORAGE_SPINOR,
 };
 
+enum qdl_skipblock_mode {
+	QDL_SKIPBLOCK_NONE,
+	QDL_SKIPBLOCK_SHA256,
+};
+
 struct qdl_device {
 	enum QDL_DEVICE_TYPE dev_type;
 	int fd;
 	size_t max_payload_size;
 	size_t sector_size;
-	enum qdl_storage_type storage_type;
+	enum qdl_storage_type current_storage_type;
+	enum qdl_skipblock_mode skipblock_mode;
 	unsigned int slot;
 
 	int (*open)(struct qdl_device *qdl, const char *serial);
@@ -76,6 +90,18 @@ struct qdl_device {
 				 const char *chained_table);
 
 	struct vip_transfer_data vip_data;
+
+	/*
+	 * Pushback buffer for stream-oriented transports (Windows COM via the
+	 * QDLoader driver, virtio-console, ...). When a single read crosses a
+	 * Firehose message boundary - typically because the binary payload of
+	 * a rawmode response trails the XML envelope in the same read - the
+	 * leftover bytes are stashed here and qdl_read() returns them before
+	 * pulling more data from the transport.
+	 */
+	char *pending_buf;
+	size_t pending_len;
+	size_t pending_off;
 };
 
 struct sahara_image {
@@ -84,6 +110,8 @@ struct sahara_image {
 	size_t len;
 };
 
+struct qdl_zip;
+
 struct libusb_device_handle;
 
 struct qdl_device *qdl_init(enum QDL_DEVICE_TYPE type);
@@ -91,12 +119,30 @@ void qdl_deinit(struct qdl_device *qdl);
 int qdl_open(struct qdl_device *qdl, const char *serial);
 void qdl_close(struct qdl_device *qdl);
 int qdl_read(struct qdl_device *qdl, void *buf, size_t len, unsigned int timeout);
+int qdl_push_back(struct qdl_device *qdl, const void *buf, size_t len);
 int qdl_write(struct qdl_device *qdl, const void *buf, size_t len, unsigned int timeout);
 void qdl_set_out_chunk_size(struct qdl_device *qdl, long size);
 int qdl_vip_transfer_enable(struct qdl_device *qdl, const char *vip_table_path);
 
 struct qdl_device *usb_init(void);
 struct qdl_device *sim_init(void);
+struct qdl_device *qud_init(void);
+struct qdl_device *auto_init(void);
+
+/*
+ * try_usb_open() - single libusb scan-and-open pass; shared between
+ * the --backend usb wait loop in usb.c and the unified auto_open() loop.
+ * Returns 0 on success (and emits the "Flashing/Collecting device" UX
+ * line), -ENODEV when no EDL device is visible, -EBUSY when one is
+ * visible but cannot be opened (typically: the Qualcomm QDLoader 9008
+ * driver has claimed it), -EIO on a libusb failure. @visible_out, if
+ * non-NULL, receives the count of EDL devices seen on this pass.
+ *
+ * qud_probe_present() returns the number of Qualcomm COM ports the QUD
+ * backend enumerated via SetupAPI; 0 on non-Windows hosts.
+ */
+int try_usb_open(struct qdl_device *qdl, const char *serial, int *visible_out);
+int qud_probe_present(void);
 
 struct qdl_device_desc {
 	int vid;
@@ -106,13 +152,27 @@ struct qdl_device_desc {
 
 struct qdl_device_desc *usb_list(unsigned int *devices_found);
 
-int firehose_run(struct qdl_device *qdl);
-int firehose_provision(struct qdl_device *qdl);
-int firehose_read_buf(struct qdl_device *qdl, struct read_op *read_op, void *out_buf, size_t out_size);
+/*
+ * QUD-side counterpart to qdl_device_desc. Serial here is the iSerial as
+ * Windows stored it in the device-instance ID (no fixed length guarantee
+ * across OEMs), and path is the kernel-driver-exposed handle the QUD
+ * backend will open (e.g. "\\\\.\\COM5").
+ */
+struct qud_device_desc {
+	unsigned int pid;
+	char serial[64];
+	char path[64];
+};
+
+struct qud_device_desc *qud_list(unsigned int *devices_found);
+
+int firehose_run(struct qdl_device *qdl, struct list_head *ops);
+int firehose_provision(struct qdl_device *qdl, bool skip_reset);
+int firehose_read_buf(struct qdl_device *qdl, struct firehose_op *read_op, void *out_buf, size_t out_size);
 int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	       const char *ramdump_path,
 	       const char *ramdump_filter);
-int load_sahara_image(const char *filename, struct sahara_image *image);
+int load_sahara_image(struct qdl_zip *zip, const char *filename, struct sahara_image *image);
 void sahara_images_free(struct sahara_image *images, size_t count);
 void print_hex_dump(const char *prefix, const void *buf, size_t len);
 unsigned int attr_as_unsigned(xmlNode *node, const char *attr, int *errors);
@@ -131,6 +191,11 @@ void print_version(void);
 int parse_storage_address(const char *address, int *physical_partition,
 			  unsigned int *start_sector, unsigned int *num_sectors,
 			  char **gpt_partition);
+
+enum qdl_storage_type decode_storage_type(const char *storage);
+const char *encode_storage_type(enum qdl_storage_type storage);
+int decode_sahara_config(struct sahara_image *blob, struct sahara_image *images,
+			 struct contents_filter *contents_filter);
 
 extern bool qdl_debug;
 

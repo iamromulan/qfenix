@@ -4,11 +4,11 @@
  * Copyright (c) 2018, The Linux Foundation. All rights reserved.
  * All rights reserved.
  */
+#include "list.h"
 #define _FILE_OFFSET_BITS 64
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -23,10 +23,14 @@
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include "qdl.h"
+#include "file.h"
+#include "firehose.h"
+#include "sha2.h"
 #include "ufs.h"
 #include "oscompat.h"
 #include "vip.h"
 #include "sparse.h"
+#include "gpt.h"
 
 enum {
 	FIREHOSE_ACK = 0,
@@ -113,6 +117,88 @@ static int firehose_generic_parser(xmlNode *node, void *data __unused, bool *raw
 	return ret;
 }
 
+/*
+ * Scan @str for a contiguous run of exactly SHA256_DIGEST_STRING_LENGTH-1
+ * (64) lowercase or uppercase hex characters bounded by a non-hex character
+ * or string boundary. On match, decode into @digest and return true.
+ */
+static bool extract_sha256_hex(const char *str, uint8_t digest[SHA256_DIGEST_LENGTH])
+{
+	const size_t hex_len = SHA256_DIGEST_LENGTH * 2;
+	const char *p = str;
+	size_t i;
+
+	while (*p) {
+		size_t run = 0;
+		const char *start;
+
+		while (*p && !isxdigit((unsigned char)*p))
+			p++;
+
+		start = p;
+		while (isxdigit((unsigned char)*p)) {
+			run++;
+			p++;
+		}
+
+		if (run == hex_len) {
+			for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+				char byte[3] = { start[i * 2], start[i * 2 + 1], '\0' };
+
+				digest[i] = (uint8_t)strtoul(byte, NULL, 16);
+			}
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static int firehose_sha256_parser(xmlNode *node, void *data, bool *rawmode)
+{
+	struct firehose_op *op = data;
+	xmlChar *value;
+	int ret;
+
+	if (xmlStrcmp(node->name, (xmlChar *)"log") == 0) {
+		value = xmlGetProp(node, (xmlChar *)"value");
+		if (!value)
+			return -EINVAL;
+
+		if (!op->digest_valid && extract_sha256_hex((const char *)value, op->digest))
+			op->digest_valid = true;
+
+		ux_log("LOG: %s\n", value);
+		xmlFree(value);
+		return -EAGAIN;
+	}
+
+	ret = firehose_generic_parser(node, NULL, rawmode);
+
+	/*
+	 * Some Firehose implementations attach the digest as an attribute on
+	 * the response itself rather than emitting it via <log>. Try a few
+	 * known attribute names.
+	 */
+	if (!op->digest_valid) {
+		static const char * const attrs[] = { "Digest", "SHA256", "sha256" };
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(attrs); i++) {
+			value = xmlGetProp(node, (xmlChar *)attrs[i]);
+			if (!value)
+				continue;
+			if (extract_sha256_hex((const char *)value, op->digest))
+				op->digest_valid = true;
+			xmlFree(value);
+			if (op->digest_valid)
+				break;
+		}
+	}
+
+	return ret;
+}
+
 static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 			 int (*response_parser)(xmlNode *node, void *data, bool *rawmode),
 			 void *data)
@@ -131,10 +217,6 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 
 	gettimeofday(&now, NULL);
 	timeradd(&now, &delta, &timeout);
-
-	/* In simulation mode we don't expent to read and parse any responses */
-	if (qdl->dev_type == QDL_DEVICE_SIM)
-		return 0;
 
 	/*
 	 * The goal of firehose_read() is to find a response to a request among
@@ -165,7 +247,7 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 		/* Timeout after seeing a response, we're done waiting for logs */
 		if (n == -ETIMEDOUT && resp >= 0)
 			break;
-		/* We want to return resp on error, to not loose the reset resposne */
+		/* We want to return resp on error, to not lose the reset response */
 		else if (n == -EIO)
 			break;
 
@@ -180,21 +262,107 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 
 		ux_debug("FIREHOSE READ: %s\n", buf);
 
-		node = firehose_response_parse(buf, n, &error);
-		if (!node)
-			return error;
+		/*
+		 * On stream-oriented transports (Windows COM port via the
+		 * QDLoader driver, virtio-console, ...) a single read can
+		 * deliver multiple back-to-back Firehose responses
+		 * concatenated, since the driver doesn't preserve USB bulk-
+		 * transfer boundaries. Walk the buffer using the "<?xml" ...
+		 * "</data>" envelope to bound each message; the closing tag
+		 * is what really delimits the document so that any rawmode
+		 * binary payload that arrives spliced onto the same read
+		 * doesn't end up fed into libxml2 as if it were XML.
+		 *
+		 * libusb preserves transfer boundaries, so on that path each
+		 * read still contains exactly one document and the loop runs
+		 * once.
+		 */
+		char *cursor = buf;
+		char *bufend = buf + n;
 
-		ret = response_parser(node, data, &rawmode);
-		xmlFreeDoc(node->doc);
+		while (cursor < bufend) {
+			char *start = strstr(cursor, "<?xml");
+			char *xml_end;
+			size_t chunk;
 
-		if (ret >= 0)
-			resp = ret;
+			if (!start)
+				break;
+
+			/*
+			 * Bound the XML on the closing </data> tag. If it's
+			 * missing the message was either truncated or doesn't
+			 * fit the schema we know how to parse; hand the rest
+			 * of the buffer to libxml2 and let it error out
+			 * gracefully.
+			 */
+			xml_end = strstr(start, "</data>");
+			if (xml_end) {
+				xml_end += sizeof("</data>") - 1;
+				chunk = (size_t)(xml_end - start);
+			} else {
+				chunk = (size_t)(bufend - start);
+			}
+
+			node = firehose_response_parse(start, chunk, &error);
+			if (!node)
+				return error;
+
+			ret = response_parser(node, data, &rawmode);
+			xmlFreeDoc(node->doc);
+
+			if (ret >= 0)
+				resp = ret;
+
+			cursor = start + chunk;
+
+			/*
+			 * The response we just parsed told the host to switch
+			 * to raw mode (e.g. the ACK that precedes the binary
+			 * sectors of a <read>). On a stream transport the
+			 * first chunk of that binary payload can have arrived
+			 * tacked onto this same read. Push it back so the
+			 * next qdl_read() picks it up before the transport
+			 * is touched again.
+			 */
+			if (rawmode) {
+				if (cursor < bufend)
+					qdl_push_back(qdl, cursor,
+						      (size_t)(bufend - cursor));
+				break;
+			}
+		}
 
 		if (rawmode)
 			break;
 	}
 
 	return resp;
+}
+
+static int firehose_vip_send_table(struct qdl_device *qdl)
+{
+	int ret;
+
+	ret = vip_transfer_handle_tables(qdl);
+	if (ret) {
+		ux_err("VIP: error occurred during VIP table transmission\n");
+		return -1;
+	}
+
+	if (!vip_transfer_status_check_needed(qdl))
+		return 0;
+
+	ret = firehose_read(qdl, 30000, firehose_generic_parser, NULL);
+	if (ret) {
+		ux_err("VIP: sending of digest table failed\n");
+		return -1;
+	}
+
+	ux_info("VIP: digest table has been sent successfully\n");
+
+	vip_transfer_clear_status(qdl);
+
+	return 0;
 }
 
 static int firehose_write(struct qdl_device *qdl, xmlDoc *doc)
@@ -206,22 +374,9 @@ static int firehose_write(struct qdl_device *qdl, xmlDoc *doc)
 
 	xmlDocDumpMemory(doc, &s, &len);
 
-	ret = vip_transfer_handle_tables(qdl);
-	if (ret) {
-		ux_err("VIP: error occurred during VIP table transmission\n");
+	ret = firehose_vip_send_table(qdl);
+	if (ret)
 		return -1;
-	}
-	if (vip_transfer_status_check_needed(qdl)) {
-		ret = firehose_read(qdl, 30000, firehose_generic_parser, NULL);
-		if (ret) {
-			ux_err("VIP: sending of digest table failed\n");
-			return -1;
-		}
-
-		ux_info("VIP: digest table has been sent successfully\n");
-
-		vip_transfer_clear_status(qdl);
-	}
 
 	vip_gen_chunk_init(qdl);
 
@@ -304,23 +459,21 @@ static int firehose_send_configure(struct qdl_device *qdl, size_t payload_size,
 				   enum qdl_storage_type storage,
 				   size_t *max_payload_size)
 {
-	static const char * const memory_names[] = {
-		[QDL_STORAGE_EMMC] = "emmc",
-		[QDL_STORAGE_NAND] = "nand",
-		[QDL_STORAGE_UFS] = "ufs",
-		[QDL_STORAGE_NVME] = "nvme",
-		[QDL_STORAGE_SPINOR] = "spinor",
-	};
+	const char *memory_name;
 	xmlNode *root;
 	xmlNode *node;
 	xmlDoc *doc;
+
+	memory_name = encode_storage_type(storage);
+	if (!memory_name)
+		return -EINVAL;
 
 	doc = xmlNewDoc((xmlChar *)"1.0");
 	root = xmlNewNode(NULL, (xmlChar *)"data");
 	xmlDocSetRootElement(doc, root);
 
 	node = xmlNewChild(root, NULL, (xmlChar *)"configure", NULL);
-	xml_setpropf(node, "MemoryName", memory_names[storage]);
+	xml_setpropf(node, "MemoryName", memory_name);
 	xml_setpropf(node, "MaxPayloadSizeToTargetInBytes", "%lu", payload_size);
 	xml_setpropf(node, "Verbose", "%d", 0);
 	xml_setpropf(node, "ZlpAwareHost", "%d", 1);
@@ -337,7 +490,7 @@ static int firehose_try_configure(struct qdl_device *qdl, bool skip_storage_init
 {
 	size_t max_sector_size;
 	size_t sector_sizes[] = { 512, 4096 };
-	struct read_op op;
+	struct firehose_op op;
 	size_t size = 0;
 	void *buf;
 	int ret;
@@ -347,13 +500,6 @@ static int firehose_try_configure(struct qdl_device *qdl, bool skip_storage_init
 				      storage, &size);
 	if (ret < 0)
 		return ret;
-
-	/*
-	 * In simulateion mode "remote" target can't propose different size, so
-	 * for QDL_DEVICE_SIM we just don't re-send configure packet
-	 */
-	if (qdl->dev_type == QDL_DEVICE_SIM)
-		return 0;
 
 	/* Retry if remote proposed different size */
 	if (size != qdl->max_payload_size) {
@@ -374,7 +520,8 @@ static int firehose_try_configure(struct qdl_device *qdl, bool skip_storage_init
 	 * builds it exits before reaching this code via the SIM early-return
 	 * above), so sending them would cause a VIP hash mismatch on the device.
 	 */
-	if (storage != QDL_STORAGE_NAND && qdl->vip_data.state == VIP_DISABLED) {
+	if (storage != QDL_STORAGE_NAND && qdl->vip_data.state == VIP_DISABLED &&
+	    !qdl->sector_size) {
 		max_sector_size = sector_sizes[ARRAY_SIZE(sector_sizes) - 1];
 		buf = alloca(max_sector_size);
 
@@ -405,7 +552,7 @@ static int firehose_try_configure(struct qdl_device *qdl, bool skip_storage_init
 	return 0;
 }
 
-static int firehose_erase(struct qdl_device *qdl, struct program *program)
+static int firehose_erase(struct qdl_device *qdl, struct firehose_op *program)
 {
 	unsigned int sector_size;
 	xmlNode *root;
@@ -421,9 +568,16 @@ static int firehose_erase(struct qdl_device *qdl, struct program *program)
 
 	node = xmlNewChild(root, NULL, (xmlChar *)"erase", NULL);
 	xml_setpropf(node, "SECTOR_SIZE_IN_BYTES", "%d", sector_size);
-	xml_setpropf(node, "num_partition_sectors", "%d", program->num_sectors);
 	xml_setpropf(node, "physical_partition_number", "%d", program->partition);
-	xml_setpropf(node, "start_sector", "%s", program->start_sector);
+
+	/*
+	 * Omitting num_sectors and start_sector attributes tells the programmer
+	 * to erase the full physical partition.
+	 */
+	if (program->num_sectors > 0) {
+		xml_setpropf(node, "num_partition_sectors", "%d", program->num_sectors);
+		xml_setpropf(node, "start_sector", "%s", program->start_sector);
+	}
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
@@ -448,12 +602,94 @@ out:
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
-static int firehose_program(struct qdl_device *qdl, struct program *program, int fd)
+static int firehose_getsha256digest(struct qdl_device *qdl, struct firehose_op *op);
+
+/*
+ * Decide whether the @program op can be skipped because its bytes are
+ * already on flash. Returns 1 if the program path can be bypassed, 0
+ * to defer to the normal write. @buf is a scratch buffer of size
+ * qdl->max_payload_size owned by the caller.
+ *
+ * Hash the bytes that would have been written, ask the device for the
+ * digest of the same region, and compare. Any failure on the way (read error,
+ * digest query failure, mismatch) returns 0 so the caller proceeds with
+ * the normal program flow; the file pointer is restored by the
+ * qdl_file_seek() at the top of the write loop.
+ *
+ * Restricted to non-sparse, non-NAND programs with VIP disabled:
+ *   - Sparse chunks would each need their own digest; v1 keeps them on
+ *     the normal program path.
+ *   - NAND has spare/OOB bytes whose semantics differ across
+ *     programmers.
+ *   - <getsha256digest> is not part of pre-built VIP digest tables.
+ */
+static int qdl_should_skipblock(struct qdl_device *qdl,
+				struct firehose_op *program,
+				struct qdl_file *file,
+				unsigned int num_sectors,
+				unsigned int sector_size,
+				void *buf)
+{
+	uint8_t local_digest[SHA256_DIGEST_LENGTH];
+	size_t total = (size_t)num_sectors * sector_size;
+	struct firehose_op digest_op;
+	size_t hashed = 0;
+	SHA2_CTX ctx;
+	ssize_t hn;
+
+	if (qdl->skipblock_mode != QDL_SKIPBLOCK_SHA256 ||
+	    program->sparse ||
+	    program->is_nand ||
+	    qdl->vip_data.state != VIP_DISABLED)
+		return 0;
+
+	SHA256Init(&ctx);
+	qdl_file_seek(file, (off_t)program->file_offset * sector_size, SEEK_SET);
+
+	while (hashed < total) {
+		size_t want = MIN(qdl->max_payload_size, total - hashed);
+
+		hn = qdl_file_read_exact(file, buf, want);
+		if (hn < 0)
+			return 0;
+		if (hn == 0 || (size_t)hn < want) {
+			/*
+			 * EOF before completing the requested region: the
+			 * device's digest is over `total` bytes from flash,
+			 * so we can't construct a matching local digest.
+			 * Defer to the normal program path.
+			 */
+			if (hn > 0)
+				SHA256Update(&ctx, buf, hn);
+			return 0;
+		}
+		SHA256Update(&ctx, buf, hn);
+		hashed += (size_t)hn;
+	}
+
+	SHA256Final(local_digest, &ctx);
+
+	digest_op = (struct firehose_op){
+		.type = FIREHOSE_OP_GET_SHA256_DIGEST,
+		.sector_size = sector_size,
+		.num_sectors = num_sectors,
+		.partition = program->partition,
+		.start_sector = program->start_sector,
+	};
+
+	if (firehose_getsha256digest(qdl, &digest_op) == 0 &&
+	    !memcmp(local_digest, digest_op.digest, SHA256_DIGEST_LENGTH))
+		return 1;
+
+	return 0;
+}
+
+static int firehose_program(struct qdl_device *qdl, struct firehose_op *program)
 {
 	unsigned int num_sectors;
 	unsigned int sector_size;
 	unsigned int zlp_timeout = 10000;
-	struct stat sb;
+	struct qdl_file file;
 	size_t chunk_size;
 	xmlNode *root;
 	xmlNode *node;
@@ -471,18 +707,23 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	 * ZLP has been measured to take up to 15 seconds on SPINOR devices,
 	 * let's double it to be on the safe side...
 	 */
-	if (qdl->storage_type == QDL_STORAGE_SPINOR)
+	if (qdl->current_storage_type == QDL_STORAGE_SPINOR)
 		zlp_timeout = 60000;
+
+	if (!program->filename)
+		return 0;
+
+	ret = qdl_file_open(program->zip, program->filename, &file);
+	if (ret < 0) {
+		ux_err("unable to open %s\n", program->filename);
+		return -1;
+	}
 
 	num_sectors = program->num_sectors;
 	sector_size = program->sector_size ? : qdl->sector_size;
 
-	ret = fstat(fd, &sb);
-	if (ret < 0)
-		err(1, "failed to stat \"%s\"\n", program->filename);
-
 	if (!program->sparse) {
-		num_sectors = (sb.st_size + sector_size - 1) / sector_size;
+		num_sectors = (qdl_file_getsize(&file) + sector_size - 1) / sector_size;
 
 		if (program->num_sectors && num_sectors > program->num_sectors) {
 			ux_err("%s to big for %s truncated to %d\n",
@@ -494,8 +735,17 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	}
 
 	buf = malloc(qdl->max_payload_size);
-	if (!buf)
-		err(1, "failed to allocate sector buffer");
+	if (!buf) {
+		ux_err("failed to allocate sector buffer\n");
+		goto err_close_fd;
+	}
+
+	if (qdl_should_skipblock(qdl, program, &file, num_sectors, sector_size, buf)) {
+		ux_info("skipped \"%s\" (sha256 match)\n", program->label);
+		free(buf);
+		qdl_file_close(&file);
+		return 0;
+	}
 
 	doc = xmlNewDoc((xmlChar *)"1.0");
 	root = xmlNewNode(NULL, (xmlChar *)"data");
@@ -520,23 +770,23 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	ret = firehose_write(qdl, doc);
 	if (ret < 0) {
 		ux_err("failed to send program request\n");
-		goto out;
+		goto err_free_doc;
 	}
 
 	ret = firehose_read(qdl, 10000, firehose_generic_parser, NULL);
 	if (ret) {
 		ux_err("failed to setup programming\n");
-		goto out;
+		goto err_free_doc;
 	}
 
 	t0 = time(NULL);
 
 	if (!program->sparse) {
-		lseek(fd, (off_t)program->file_offset * sector_size, SEEK_SET);
+		qdl_file_seek(&file, (off_t)program->file_offset * sector_size, SEEK_SET);
 	} else {
 		switch (program->sparse_chunk_type) {
 		case CHUNK_TYPE_RAW:
-			lseek(fd, program->sparse_offset, SEEK_SET);
+			qdl_file_seek(&file, program->sparse_offset, SEEK_SET);
 			break;
 		case CHUNK_TYPE_FILL:
 			fill_value = program->sparse_fill_value;
@@ -545,7 +795,7 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 			break;
 		default:
 			ux_err("[SPARSE] invalid chunk type\n");
-			goto out;
+			goto err_free_doc;
 		}
 	}
 
@@ -563,34 +813,29 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
 
 		if (!program->sparse || program->sparse_chunk_type != CHUNK_TYPE_FILL) {
-			n = read(fd, buf, chunk_size * sector_size);
+			n = qdl_file_read_exact(&file, buf, chunk_size * sector_size);
 			if (n < 0) {
 				ux_err("failed to read %s\n", program->filename);
-				goto out;
+				goto err_free_doc;
 			}
 
-			if ((size_t)n < qdl->max_payload_size)
-				memset(buf + n, 0, qdl->max_payload_size - n);
+			/*
+			 * qdl_file_read_exact() only returns short on true
+			 * EOF. The wire protocol expects exactly
+			 * chunk_size * sector_size bytes, so zero-pad the
+			 * residue (which is at most the trailing partial
+			 * sector of the file).
+			 */
+			if ((size_t)n < chunk_size * sector_size)
+				memset(buf + n, 0, chunk_size * sector_size - n);
 		}
 
 		vip_gen_chunk_update(qdl, buf, chunk_size * sector_size);
 
-		ret = vip_transfer_handle_tables(qdl);
-		if (ret) {
-			ux_err("VIP: error occurred during VIP table transmission\n");
+		ret = firehose_vip_send_table(qdl);
+		if (ret)
 			return -1;
-		}
-		if (vip_transfer_status_check_needed(qdl)) {
-			ret = firehose_read(qdl, 30000, firehose_generic_parser, NULL);
-			if (ret) {
-				ux_err("VIP: sending of digest table failed\n");
-				return -1;
-			}
 
-			ux_info("VIP: digest table has been sent successfully\n");
-
-			vip_transfer_clear_status(qdl);
-		}
 		n = qdl_write(qdl, buf, chunk_size * sector_size, zlp_timeout);
 		if (n < 0) {
 			ux_err("USB write failed for data chunk\n");
@@ -598,13 +843,13 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 			if (ret)
 				ux_err("flashing of chunk failed\n");
 
-			goto out;
+			goto err_free_doc;
 		}
 
 		if ((size_t)n != chunk_size * sector_size) {
 			ux_err("USB write truncated\n");
 			ret = -1;
-			goto out;
+			goto err_free_doc;
 		}
 
 		left -= chunk_size;
@@ -616,7 +861,7 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 	t = time(NULL) - t0;
 
 	ret = firehose_read(qdl, 120000, firehose_generic_parser, NULL);
-	if (ret) {
+	if (ret != FIREHOSE_ACK) {
 		ux_err("flashing of %s failed\n", program->label);
 	} else if (t) {
 		ux_info("flashed \"%s\" successfully at %lukB/s\n",
@@ -627,14 +872,22 @@ static int firehose_program(struct qdl_device *qdl, struct program *program, int
 			program->label);
 	}
 
-out:
 	xmlFreeDoc(doc);
 	free(buf);
+	qdl_file_close(&file);
 
-	return ret == FIREHOSE_ACK ? 0 : -1;
+	return 0;
+
+err_free_doc:
+	xmlFreeDoc(doc);
+	free(buf);
+err_close_fd:
+	qdl_file_close(&file);
+
+	return -1;
 }
 
-static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
+static int firehose_issue_read(struct qdl_device *qdl, struct firehose_op *read_op,
 			       int fd, void *out_buf, size_t out_len, bool quiet)
 {
 	unsigned int sector_size;
@@ -651,8 +904,10 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	int n;
 
 	buf = malloc(qdl->max_payload_size);
-	if (!buf)
-		err(1, "failed to allocate sector buffer");
+	if (!buf) {
+		ux_err("failed to allocate sector buffer\n");
+		return -1;
+	}
 
 	doc = xmlNewDoc((xmlChar *)"1.0");
 	root = xmlNewNode(NULL, (xmlChar *)"data");
@@ -688,28 +943,50 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 
 	left = read_op->num_sectors;
 	while (left > 0) {
+		size_t want;
+		size_t got;
+
 		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
+		want = chunk_size * sector_size;
 
-		n = qdl_read(qdl, buf, chunk_size * sector_size, 30000);
-		if (n < 0) {
-			err(1, "failed to read");
-		}
-
-		if ((size_t)n != chunk_size * sector_size) {
-			err(1, "failed to read full sector");
+		/*
+		 * Accumulate the chunk across qdl_read() calls. libusb usually
+		 * delivers an entire bulk transfer in one shot, but stream
+		 * transports (QUD's Windows COM port, virtio-console, ...) can
+		 * fragment it - including the rawmode tail that firehose_read()
+		 * pushed back from the same buffer as the ACK response.
+		 */
+		got = 0;
+		while (got < want) {
+			n = qdl_read(qdl, (char *)buf + got, want - got, 30000);
+			if (n < 0) {
+				ux_err("failed to read sector data\n");
+				ret = -1;
+				goto out;
+			}
+			if (n == 0) {
+				ux_err("unexpected EOF while reading sector data\n");
+				ret = -1;
+				goto out;
+			}
+			got += (size_t)n;
 		}
 
 		if (out_buf) {
-			if ((size_t)n > out_len - out_offset)
-				n = out_len - out_offset;
+			size_t copy = want;
 
-			memcpy(out_buf + out_offset, buf, n);
-			out_offset += n;
+			if (copy > out_len - out_offset)
+				copy = out_len - out_offset;
+
+			memcpy((char *)out_buf + out_offset, buf, copy);
+			out_offset += copy;
 		} else {
-			n = write(fd, buf, n);
+			n = write(fd, buf, want);
 
-			if (n < 0 || (size_t)n != chunk_size * sector_size) {
-				err(1, "failed to write");
+			if (n < 0 || (size_t)n != want) {
+				ux_err("failed to write sector data\n");
+				ret = -1;
+				goto out;
 			}
 		}
 
@@ -744,22 +1021,101 @@ out:
 	return ret;
 }
 
-int firehose_read_buf(struct qdl_device *qdl, struct read_op *read_op, void *out_buf, size_t out_size)
+int firehose_read_buf(struct qdl_device *qdl, struct firehose_op *read_op, void *out_buf, size_t out_size)
 {
 	return firehose_issue_read(qdl, read_op, -1, out_buf, out_size, true);
 }
 
-static int firehose_read_op(struct qdl_device *qdl, struct read_op *read_op, int fd)
+static int firehose_read_op(struct qdl_device *qdl, struct firehose_op *op)
 {
-	return firehose_issue_read(qdl, read_op, fd, NULL, 0, false);
+	int ret;
+	int fd;
+
+	fd = open(op->filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+	if (fd < 0) {
+		ux_info("unable to open %s...\n", op->filename);
+		return -1;
+	}
+
+	ret = firehose_issue_read(qdl, op, fd, NULL, 0, false);
+
+	close(fd);
+
+	return ret;
 }
 
-static int firehose_apply_patch(struct qdl_device *qdl, struct patch *patch)
+/*
+ * Issue a <getsha256digest> request and store the result on @op. On
+ * success op->digest is populated and op->digest_valid is set; callers
+ * that want to surface the digest (the qdl `sha256` subcommand prints
+ * it after firehose_run() returns; the --skipblock=sha256 fast-path
+ * compares it against a locally-computed digest) consume the field
+ * themselves.
+ */
+static int firehose_getsha256digest(struct qdl_device *qdl, struct firehose_op *op)
+{
+	unsigned int sector_size;
+	xmlNode *root;
+	xmlNode *node;
+	xmlDoc *doc;
+	int ret;
+
+	sector_size = op->sector_size ? : qdl->sector_size;
+
+	doc = xmlNewDoc((xmlChar *)"1.0");
+	root = xmlNewNode(NULL, (xmlChar *)"data");
+	xmlDocSetRootElement(doc, root);
+
+	node = xmlNewChild(root, NULL, (xmlChar *)"getsha256digest", NULL);
+	xml_setpropf(node, "SECTOR_SIZE_IN_BYTES", "%d", sector_size);
+	xml_setpropf(node, "num_partition_sectors", "%d", op->num_sectors);
+	xml_setpropf(node, "physical_partition_number", "%d", op->partition);
+	xml_setpropf(node, "start_sector", "%s", op->start_sector);
+	if (qdl->slot != UINT_MAX)
+		xml_setpropf(node, "slot", "%u", qdl->slot);
+
+	op->digest_valid = false;
+
+	ret = firehose_write(qdl, doc);
+	if (ret < 0) {
+		ux_err("failed to send getsha256digest command\n");
+		goto out;
+	}
+
+	ret = firehose_read(qdl, 30000, firehose_sha256_parser, op);
+	if (ret != FIREHOSE_ACK) {
+		ux_err("getsha256digest failed for %s+0x%x\n",
+		       op->start_sector, op->num_sectors);
+		ret = -1;
+		goto out;
+	}
+
+	if (!op->digest_valid) {
+		ux_err("getsha256digest returned no digest for %s+0x%x\n",
+		       op->start_sector, op->num_sectors);
+		ret = -1;
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	xmlFreeDoc(doc);
+	return ret;
+}
+
+static int firehose_apply_patch(struct qdl_device *qdl, struct firehose_op *patch)
 {
 	xmlNode *root;
 	xmlNode *node;
 	xmlDoc *doc;
 	int ret;
+
+	if (!patch->filename)
+		return 0;
+
+	if (strcmp(patch->filename, "DISK"))
+		return 0;
 
 	ux_debug("applying patch \"%s\"\n", patch->what);
 
@@ -971,6 +1327,9 @@ static int firehose_detect_and_configure(struct qdl_device *qdl,
 	struct timeval now;
 	int ret;
 
+	/* Track the currently configured storage type */
+	qdl->current_storage_type = storage;
+
 	/*
 	 * The speculative retry loop below sends configure (and therefore the
 	 * VIP table) before the programmer has had a chance to start up and
@@ -1014,7 +1373,7 @@ static int firehose_detect_and_configure(struct qdl_device *qdl,
 	return 0;
 }
 
-int firehose_provision(struct qdl_device *qdl)
+int firehose_provision(struct qdl_device *qdl, bool skip_reset)
 {
 	int ret;
 
@@ -1030,60 +1389,129 @@ int firehose_provision(struct qdl_device *qdl)
 	else
 		ux_info("UFS provisioning failed\n");
 
-	firehose_reset(qdl);
+	if (!skip_reset)
+		firehose_reset(qdl);
 
 	return ret;
 
 }
 
-int firehose_run(struct qdl_device *qdl)
+struct firehose_op *firehose_alloc_op(int type)
 {
-	bool multiple;
-	int bootable;
+	struct firehose_op *op;
+
+	op = calloc(1, sizeof(*op));
+	if (!op)
+		return NULL;
+
+	op->type = type;
+	return op;
+}
+
+void firehose_free_ops(struct list_head *ops)
+{
+	struct firehose_op *next;
+	struct firehose_op *op;
+
+	list_for_each_entry_safe(op, next, ops, node) {
+		list_del(&op->node);
+		qdl_zip_put(op->zip);
+		free((void *)op->filename);
+		free((void *)op->label);
+		free((void *)op->start_sector);
+		free((void *)op->gpt_partition);
+		free((void *)op->value);
+		free((void *)op->what);
+		free(op);
+	}
+}
+
+static int firehose_execute_ops(struct qdl_device *qdl, struct list_head *ops)
+{
+	unsigned int patch_count = 0;
+	struct firehose_op *status_patch = NULL;
+	struct firehose_op *tmp;
+	struct firehose_op *op;
+	unsigned int patch_idx = 0;
 	int ret;
 
-	ux_info("waiting for programmer...\n");
+	list_for_each_entry(op, ops, node) {
+		switch (op->type) {
+		case FIREHOSE_OP_CONFIGURE:
+			ret = firehose_detect_and_configure(qdl, false, op->storage_type, 5);
+			if (ret)
+				return ret;
 
-	ret = firehose_detect_and_configure(qdl, false, qdl->storage_type, 5);
-	if (ret)
-		return ret;
+			ret = gpt_resolve_deferrals(qdl, ops);
+			if (ret)
+				return ret;
 
-	ret = read_resolve_gpt_deferrals(qdl);
-	if (ret)
-		return ret;
+			/* Update the number of patches for this storage device */
+			patch_count = 0;
+			patch_idx = 0;
+			tmp = op;
+			list_for_each_entry_continue(tmp, ops, node) {
+				if (tmp->type == FIREHOSE_OP_CONFIGURE)
+					break;
+				if (tmp->type != FIREHOSE_OP_PATCH)
+					continue;
+				if (tmp->filename && !strcmp(tmp->filename, "DISK")) {
+					patch_count++;
+					status_patch = tmp;
+				}
+			}
+			break;
+		case FIREHOSE_OP_PROGRAM:
+			ret = firehose_program(qdl, op);
+			if (ret < 0)
+				return ret;
+			break;
+		case FIREHOSE_OP_ERASE:
+			ret = firehose_erase(qdl, op);
+			if (ret < 0)
+				return ret;
+			break;
+		case FIREHOSE_OP_READ:
+			ret = firehose_read_op(qdl, op);
+			if (ret < 0)
+				return ret;
+			break;
+		case FIREHOSE_OP_GET_SHA256_DIGEST:
+			ret = firehose_getsha256digest(qdl, op);
+			if (ret < 0)
+				return ret;
+			break;
+		case FIREHOSE_OP_PATCH:
+			ret = firehose_apply_patch(qdl, op);
+			if (ret)
+				return ret;
 
-	ret = program_resolve_gpt_deferrals(qdl);
-	if (ret)
-		return ret;
+			if (op->filename && !strcmp(op->filename, "DISK"))
+				ux_progress("Applying patches", ++patch_idx, patch_count);
 
-	ret = erase_execute(qdl, firehose_erase);
-	if (ret)
-		return ret;
-
-	ret = program_execute(qdl, firehose_program);
-	if (ret)
-		return ret;
-
-	ret = patch_execute(qdl, firehose_apply_patch);
-	if (ret)
-		return ret;
-
-	ret = read_op_execute(qdl, firehose_read_op);
-	if (ret)
-		return ret;
-
-	bootable = program_find_bootable_partition(&multiple);
-	if (bootable < 0) {
-		ux_debug("no boot partition found\n");
-	} else {
-		if (multiple) {
-			ux_info("Multiple candidates for primary bootloader found, using partition %d\n",
-				bootable);
+			if (op == status_patch)
+				ux_info("%d patches applied\n", patch_idx);
+			break;
+		case FIREHOSE_OP_SET_BOOTABLE:
+			firehose_set_bootable(qdl, op->partition);
+			break;
+		case FIREHOSE_OP_RESET:
+			ret = firehose_reset(qdl);
+			if (ret < 0)
+				return ret;
+			break;
+		default:
+			ux_err("internal error: unknown firehose operation %d\n", op->type);
+			return -1;
 		}
-		firehose_set_bootable(qdl, bootable);
 	}
 
-	firehose_reset(qdl);
-
 	return 0;
+}
+
+int firehose_run(struct qdl_device *qdl, struct list_head *ops)
+{
+	ux_info("waiting for Firehose programmer...\n");
+
+	return firehose_execute_ops(qdl, ops);
 }

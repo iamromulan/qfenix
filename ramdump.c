@@ -17,7 +17,13 @@ static void print_usage(FILE *out)
 	extern const char *__progname;
 
 	fprintf(out,
-		"%s [--debug] [-o <ramdump-path>] [segment-filter,...]\n",
+		"%s [--debug] [-o <ramdump-path>] [segment-filter]\n\n"
+		" -d, --debug\t\tEnable debug output\n"
+		" -v, --version\t\tPrint version\n"
+		" -o, --output=PATH\tDirectory to write ramdump segments into (default: .)\n"
+		" -S, --serial=T\t\tSelect target by serial number T (e.g. <0AA94EFD>)\n"
+		" -h, --help\t\tPrint this usage info\n"
+		" [segment-filter]\tOptional comma-separated list of segment names to dump\n",
 		__progname);
 }
 
@@ -25,7 +31,7 @@ int main(int argc, char **argv)
 {
 	struct qdl_device *qdl;
 
-	qdl = qdl_init(QDL_DEVICE_USB);
+	qdl = qdl_init(QDL_DEVICE_AUTO);
 	if (!qdl)
 		return 1;
 

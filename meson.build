@@ -1,0 +1,241 @@
+project('qdl', 'c',
+  default_options : ['warning_level=2', 'optimization=2'],
+  license: 'BSD-3-Clause',
+  meson_version: '>=1.1.0'
+)
+
+# Determine version
+git_check_ver = run_command('git', 'describe', '--dirty', '--always', '--tags', check: false).stdout().strip()
+git_v = git_check_ver != '' ? git_check_ver : 'unknown-version'
+env_v = get_option('VERSION')
+ver   = env_v != '' ? env_v : git_v
+
+# Dependencies
+libusb_dep = dependency('libusb-1.0')
+libxml_dep = dependency('libxml-2.0')
+libzip_dep = dependency('libzip')
+help2man = find_program('help2man', required: false)
+cmocka_dep = dependency('cmocka', required: get_option('tests'))
+
+# Common include dirs
+inc = include_directories('.')
+
+# Windows-specific link flags
+ws2_dep = []
+setupapi_dep = []
+if host_machine.system() == 'windows'
+  ws2_dep = meson.get_compiler('c').find_library('ws2_32', required : false)
+  # SetupAPI / cfgmgr32 are needed by the QUD backend to enumerate Qualcomm
+  # COM ports exposed by the official QDLoader 9008 driver.
+  setupapi_dep = [
+    meson.get_compiler('c').find_library('setupapi', required : false),
+    meson.get_compiler('c').find_library('cfgmgr32', required : false),
+  ]
+endif
+
+common_dep = [libusb_dep, libxml_dep, libzip_dep, ws2_dep, setupapi_dep]
+
+# Compile-only view of common_dep (includes + cflags, no link args).
+# Used on executables so their own sources see the headers, while link
+# args propagate exactly once through the static library below, avoiding
+# duplicate "-l..." entries on the link line.
+common_compile_dep = []
+foreach d : [libusb_dep, libxml_dep, libzip_dep]
+  common_compile_dep += d.partial_dependency(compile_args: true, includes: true)
+endforeach
+
+# --- version header generation ---
+conf = configuration_data()
+conf.set('version', ver)
+
+version_h = configure_file(
+  input: 'version.h.in',
+  output: 'version.h',
+  configuration: conf
+)
+
+common_sources = files(
+  'sahara.c', 'util.c', 'ux.c', 'oscompat.c', 'file.c'
+)
+
+shared_lib = static_library('qdl_common', common_sources, dependencies: common_dep)
+
+# --- qdl executable ---
+qdl_sources = files(
+  'auto.c', 'qud.c',
+  'firehose.c',
+  'io.c', 'qdl.c', 'patch.c',
+  'program.c', 'read.c', 'sha2.c', 'sim.c', 'ufs.c', 'usb.c',
+  'vip.c', 'sparse.c', 'gpt.c', 'flashmap.c', 'json.c', 'contents.c', 'pathbuf.c',
+  'zipper.c',
+)
+
+qdl_exe = executable('qdl',
+  sources : qdl_sources + [version_h],
+  link_with: shared_lib,
+  dependencies : common_compile_dep,
+  include_directories : inc,
+  install : true
+)
+
+# --- qdl-ramdump executable ---
+ramdump_sources = files(
+  'ramdump.c', 'auto.c', 'qud.c', 'io.c', 'sha2.c', 'sim.c', 'usb.c'
+)
+
+qdl_ramdump_exe = executable('qdl-ramdump',
+  sources : ramdump_sources + [version_h],
+  link_with: shared_lib,
+  dependencies : common_compile_dep,
+  include_directories : inc,
+  install : true
+)
+
+# --- qdl-ks executable ---
+ks_sources = files('ks.c')
+
+qdl_ks_exe = executable('qdl-ks',
+  sources : ks_sources + [version_h],
+  link_with: shared_lib,
+  dependencies : common_compile_dep,
+  include_directories : inc,
+  install : true
+)
+
+# -- tests ---
+test(
+  'VIP table generation',
+  find_program('bash'),
+  args: [meson.current_source_dir() / 'tests/test_vip_generation.sh', '--builddir', meson.current_build_dir()],
+  depends: [qdl_exe],
+  suite: 'integration',
+)
+
+test(
+  'Flashmap dry-run',
+  find_program('bash'),
+  args: [meson.current_source_dir() / 'tests/test_flashmap.sh', '--builddir', meson.current_build_dir()],
+  depends: [qdl_exe],
+  suite: 'integration',
+  protocol: 'tap',
+)
+
+if cmocka_dep.found()
+  test_program_load_xml = executable('test_program_load_xml',
+    sources : [
+      'tests/test_program_load_xml.c',
+      'tests/common.c',
+      'pathbuf.c',
+      'program.c',
+      'util.c',
+      version_h,
+    ],
+    dependencies : common_dep + [cmocka_dep],
+    include_directories : inc,
+    c_args : ['-Daccess=mock_access'],
+  )
+
+  test(
+    'program_load_xml path resolution',
+    test_program_load_xml,
+    suite: 'unit',
+    protocol: 'tap',
+    env: ['CMOCKA_MESSAGE_OUTPUT=TAP'],
+  )
+
+  test_pathbuf = executable('test_pathbuf',
+    sources : [
+      'tests/test_pathbuf.c',
+      'pathbuf.c',
+    ],
+    dependencies : common_dep + [cmocka_dep],
+    include_directories : inc,
+  )
+
+  test(
+    'pathbuf dirname behavior',
+    test_pathbuf,
+    suite: 'unit',
+    protocol: 'tap',
+    env: ['CMOCKA_MESSAGE_OUTPUT=TAP'],
+  )
+
+  test_contents_selectors = executable('test_contents_selectors',
+    sources : [
+      'tests/test_contents_selectors.c',
+      'pathbuf.c',
+    ],
+    dependencies : common_dep + [cmocka_dep],
+    include_directories : inc,
+  )
+
+  test(
+    'contents selector resolution',
+    test_contents_selectors,
+    suite: 'unit',
+    protocol: 'tap',
+    env: ['CMOCKA_MESSAGE_OUTPUT=TAP'],
+  )
+
+  test_contents_xml = executable('test_contents_xml',
+    sources : [
+      'tests/test_contents_xml.c',
+      'tests/common.c',
+      'pathbuf.c',
+    ],
+    dependencies : common_dep + [cmocka_dep],
+    include_directories : inc,
+  )
+
+  test(
+    'contents XML parsing',
+    test_contents_xml,
+    suite: 'unit',
+    protocol: 'tap',
+    env: ['CMOCKA_MESSAGE_OUTPUT=TAP'],
+  )
+else
+  warning('cmocka not found; skipping unit tests')
+endif
+
+# --- checkpatch targets  ---
+check_script = join_paths(meson.project_source_root(), 'scripts', 'checkpatch_wrapper.sh')
+foreach checkpatchparam : ['download-checkpatch', 'check', 'check-cached', 'check-range']
+  run_target(checkpatchparam,
+    command: ['bash', '-lc', check_script + ' ' + checkpatchparam]
+  )
+endforeach
+
+# --- markdown lint target ---
+markdown_script = join_paths(meson.project_source_root(), 'scripts', 'markdownlint_wrapper.sh')
+run_target('markdown-lint',
+  command: ['bash', '-lc', markdown_script + ' check']
+)
+
+# --- man generation ---
+if help2man.found()
+  # Test if we can run the built executable (might fail in cross-compilation)
+  can_run_exe = not meson.is_cross_build()
+
+  if can_run_exe
+    manpage_targets = []
+    foreach prog : [
+      ['qdl', qdl_exe, 'Qualcomm Download'],
+      ['qdl-ramdump', qdl_ramdump_exe, 'Qualcomm Download Ramdump'],
+      ['qdl-ks', qdl_ks_exe, 'Qualcomm KS']
+    ]
+      manpage_targets += custom_target(prog[0] + '.1',
+        input: prog[1],
+        output: prog[0] + '.1',
+        command: [help2man, '-N', '-n', prog[2], prog[1].full_path()],
+        capture: true,
+        install: true,
+        install_dir: get_option('mandir') / 'man1')
+    endforeach
+
+    # Replicate the "manpages" phony target. alias_target requires at
+    # least one dependency, so it is only declared when we have actually
+    # produced manpage targets above.
+    alias_target('manpages', manpage_targets)
+  endif
+endif

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <sys/types.h>
-#include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -104,9 +103,9 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			filename = &optarg[colon - optarg + 1];
-			ret = load_sahara_image(filename, &mappings[file_id]);
+			ret = load_sahara_image(NULL, filename, &mappings[file_id]);
 			if (ret < 0)
-				exit(1);
+				return 1;
 
 			printf("Created mapping ID:%ld File:%s\n", file_id, filename);
 			break;

@@ -2,7 +2,6 @@
 /*
  * Copyright (c) 2018, The Linux Foundation. All rights reserved.
  */
-#include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -170,7 +169,7 @@ int ufs_load(const char *ufs_file, bool finalize_provisioning)
 		} else if (xmlGetProp(node, (xmlChar *)"LUNum")) {
 			ufs_body_tmp = ufs_parse_body(node);
 			if (ufs_body_tmp) {
-				list_add(&ufs_bodies, &ufs_body_tmp->node);
+				list_append(&ufs_bodies, &ufs_body_tmp->node);
 			} else {
 				ux_err("invalid UFS body tag found in \"%s\"\n",
 				       ufs_file);
