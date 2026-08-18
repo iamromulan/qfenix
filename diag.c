@@ -716,8 +716,31 @@ int diag_offline(struct diag_session *sess)
 
 int diag_online(struct diag_session *sess)
 {
+	int ret;
+
+	/*
+	 * Issue the mode change first, then log truthfully based on the
+	 * outcome.  On some firmwares (observed: Quectel SDX62
+	 * RM520NGLAAR01A05M4G_01.001.01.001) DIAG_MODE_ONLINE is accepted
+	 * by the firmware but does NOT actually return CFUN to 1 — the
+	 * modem stays at +CFUN: 7 at the AT surface.  An unconditional
+	 * "switching modem back to online mode" log line in that case
+	 * misleads the operator into thinking recovery happened when it
+	 * didn't.  Recovery in practice requires AT+CFUN=1,1 on a paired
+	 * AT port followed by ~35s settle, OR the DIAG_MODE_RESET path
+	 * already used by the XQCN-restore call site below.
+	 */
+	ret = diag_set_mode(sess, DIAG_MODE_ONLINE);
+	if (ret) {
+		ux_warn("failed to switch modem back to online mode "
+			"(DIAG_MODE_ONLINE rejected) — modem may be left "
+			"at CFUN=7; recover with AT+CFUN=1,1 on the paired "
+			"AT port and wait ~35s\n");
+		return ret;
+	}
+
 	ux_info("switching modem back to online mode\n");
-	return diag_set_mode(sess, DIAG_MODE_ONLINE);
+	return 0;
 }
 
 /*
@@ -1567,6 +1590,29 @@ out:
 	return ret;
 }
 
+/*
+ * Lower bound for a "looks plausible" EFS factory-image dump.
+ * Real EFS partitions are megabytes; the original report observed a
+ * 517-byte stub being treated as success because the read loop exited
+ * on the very first stream_state==0 response without ever transferring
+ * a payload byte.  Anything below this threshold is almost certainly
+ * a stub / handshake-only failure mode and should fail-fast rather
+ * than mislead the operator.
+ */
+#define EFS_DUMP_MIN_PLAUSIBLE_BYTES	(16 * 1024)
+
+/*
+ * Lower bounds for a "looks plausible" XQCN backup.  Even a freshly
+ * SPC-defaulted unit returns a handful of NV items (manufacturer ID,
+ * firmware version, default RF calibration, etc.) and a handful of
+ * EFS files (system paths, default config). Below these floors the
+ * backup is almost certainly the no-NV / no-EFS / handshake-only
+ * failure mode where each per-item probe printed "DIAG read failed"
+ * but the outer walk swallowed the failures and continued.
+ */
+#define XQCN_MIN_NV_ITEMS	5
+#define XQCN_MIN_EFS_FILES	5
+
 int diag_efs_dump(struct diag_session *sess, const char *output_file)
 {
 	uint8_t cmd[64];
@@ -1575,6 +1621,7 @@ int diag_efs_dump(struct diag_session *sess, const char *output_file)
 	int n;
 	int ret = -1;
 	uint8_t stream_state;
+	size_t bytes_written = 0;
 
 	if (!sess->efs_detected) {
 		n = diag_efs_detect(sess);
@@ -1631,6 +1678,7 @@ int diag_efs_dump(struct diag_session *sess, const char *output_file)
 				ux_err("write failed: %s\n", strerror(errno));
 				goto out;
 			}
+			bytes_written += (size_t)(n - 12);
 		}
 
 		if (stream_state == 0)
@@ -1642,11 +1690,26 @@ int diag_efs_dump(struct diag_session *sess, const char *output_file)
 	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_FACT_IMAGE_END);
 	diag_send(sess, cmd, 4, resp, sizeof(resp));
 
-	ux_info("EFS dump complete: %s\n", output_file);
+	/*
+	 * Sanity-check the captured payload before claiming success.  See
+	 * EFS_DUMP_MIN_PLAUSIBLE_BYTES rationale above.
+	 */
+	if (bytes_written < EFS_DUMP_MIN_PLAUSIBLE_BYTES) {
+		ux_err("EFS dump output is implausibly small (%zu bytes, "
+		       "expected ≥ %u) — modem likely returned an empty "
+		       "factory image. Treating as failure.\n",
+		       bytes_written, (unsigned)EFS_DUMP_MIN_PLAUSIBLE_BYTES);
+		goto out;
+	}
+
+	ux_info("EFS dump complete: %s (%zu bytes)\n",
+		output_file, bytes_written);
 	ret = 0;
 
 out:
 	close(fd);
+	if (ret != 0)
+		(void)unlink(output_file);
 	return ret;
 }
 
@@ -4291,6 +4354,45 @@ int diag_efs_backup_xqcn(struct diag_session *sess, const char *output_file)
 
 	fprintf(fp, "</Storage>\n");
 	fclose(fp);
+
+	/*
+	 * Sanity-check capture totals before claiming success.  The original
+	 * report observed an exit-0 outcome on a run that produced 8000+
+	 * "DIAG read failed" lines on stderr because each individual probe
+	 * failure prints but does not abort the walk.  The minimum thresholds
+	 * below catch the no-NV / no-EFS / handshake-only failure modes
+	 * without rejecting genuinely-tiny captures (a zeroed-out unit still
+	 * has a few NV items).
+	 */
+	{
+		int total_nv = def_nv.count + sim1_nv.count;
+		int total_efs = efs_data.count;
+		int rc = 0;
+
+		if (total_nv < XQCN_MIN_NV_ITEMS) {
+			ux_err("XQCN backup captured only %d NV item(s) "
+			       "(expected ≥ %d) — modem likely failed to "
+			       "respond to the NV scan. Treating as failure.\n",
+			       total_nv, XQCN_MIN_NV_ITEMS);
+			rc = -1;
+		}
+		if (total_efs < XQCN_MIN_EFS_FILES) {
+			ux_err("XQCN backup captured only %d EFS file(s) "
+			       "(expected ≥ %d) — EFS tree walk likely "
+			       "failed. Treating as failure.\n",
+			       total_efs, XQCN_MIN_EFS_FILES);
+			rc = -1;
+		}
+
+		if (rc != 0) {
+			(void)unlink(output_file);
+			nv_scan_result_free(&def_nv);
+			nv_scan_result_free(&sim1_nv);
+			xqcn_efs_free(&efs_data);
+			path_set_free(&seen);
+			return rc;
+		}
+	}
 
 	ux_info("XQCN backup complete: %s\n", output_file);
 	ux_info("  NV items: %d default, %d SIM_1\n",

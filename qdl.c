@@ -4467,28 +4467,96 @@ static int qdl_efsrestore(int argc, char **argv)
 	return !!ret;
 }
 
+/*
+ * Parse argv for a [-o <file>] flag pair plus a single positional input
+ * argument.  Both subcommands xqcn2tar and tar2xqcn use this shape and
+ * previously hit a parser quirk where `-o` was treated as a positional
+ * output filename (e.g. `xqcn2tar in.xqcn -o out.tar` wrote to a file
+ * literally named "-o" and silently ignored "out.tar").
+ *
+ * Accepts:
+ *   <input>                       (output defaults to *default_output)
+ *   <input> <output>              (legacy positional form)
+ *   <input> -o <output>           (flag form, matches efsbackup/efsdump)
+ *   -o <output> <input>           (flag-first form)
+ *
+ * On success, *input and *output point into argv (input is required;
+ * output falls back to default_output if neither form supplied one).
+ * Returns 0 on success, -1 on a parse error (e.g. duplicate -o, -o
+ * without a value, multiple positional inputs).
+ */
+static int parse_in_out(int argc, char **argv, const char *default_output,
+			const char **input, const char **output)
+{
+	const char *in = NULL;
+	const char *out = NULL;
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-o") || !strcmp(argv[i], "--output")) {
+			if (out) {
+				fprintf(stderr,
+					"error: -o specified more than once\n");
+				return -1;
+			}
+			if (i + 1 >= argc) {
+				fprintf(stderr,
+					"error: -o requires a filename\n");
+				return -1;
+			}
+			out = argv[++i];
+		} else if (in) {
+			fprintf(stderr,
+				"error: unexpected extra positional argument "
+				"'%s' (already have input '%s'). If you meant "
+				"to set the output file, use -o.\n",
+				argv[i], in);
+			return -1;
+		} else {
+			in = argv[i];
+		}
+	}
+
+	if (!in) {
+		fprintf(stderr, "error: missing input filename\n");
+		return -1;
+	}
+
+	*input = in;
+	*output = out ? out : default_output;
+	return 0;
+}
+
 static void print_xqcn2tar_help(FILE *out)
 {
 	extern const char *__progname;
 
-	fprintf(out, "Usage: %s xqcn2tar <input.xqcn> [output.tar]\n", __progname);
+	fprintf(out, "Usage: %s xqcn2tar <input.xqcn> [-o <output.tar>]\n", __progname);
 	fprintf(out, "\nConvert XQCN backup to TAR archive (offline, no device needed).\n");
 	fprintf(out, "NV items are stored as nv_items/NNNNN.bin in the TAR.\n");
+	fprintf(out, "\nIf -o is omitted, output defaults to 'output.tar'.\n");
+	fprintf(out, "Legacy positional form `<input> <output>` is also accepted.\n");
 	fprintf(out, "\nExamples:\n");
 	fprintf(out, "  %s xqcn2tar backup.xqcn\n", __progname);
+	fprintf(out, "  %s xqcn2tar backup.xqcn -o my_backup.tar\n", __progname);
 	fprintf(out, "  %s xqcn2tar backup.xqcn my_backup.tar\n", __progname);
 }
 
 static int qdl_xqcn2tar(int argc, char **argv)
 {
+	const char *input;
+	const char *output;
+
 	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
 	    strcmp(argv[1], "--help") == 0) {
 		print_xqcn2tar_help(argc < 2 ? stderr : stdout);
 		return argc < 2 ? 1 : 0;
 	}
 
-	const char *input = argv[1];
-	const char *output = argc >= 3 ? argv[2] : "output.tar";
+	if (parse_in_out(argc, argv, "output.tar", &input, &output) < 0) {
+		print_xqcn2tar_help(stderr);
+		return 1;
+	}
 
 	return !!diag_xqcn_to_tar(input, output);
 }
@@ -4497,24 +4565,32 @@ static void print_tar2xqcn_help(FILE *out)
 {
 	extern const char *__progname;
 
-	fprintf(out, "Usage: %s tar2xqcn <input.tar> [output.xqcn]\n", __progname);
+	fprintf(out, "Usage: %s tar2xqcn <input.tar> [-o <output.xqcn>]\n", __progname);
 	fprintf(out, "\nConvert TAR archive to XQCN format (offline, no device needed).\n");
 	fprintf(out, "TAR entries under nv_items/ are converted to NV_ITEM_ARRAY.\n");
+	fprintf(out, "\nIf -o is omitted, output defaults to 'output.xqcn'.\n");
+	fprintf(out, "Legacy positional form `<input> <output>` is also accepted.\n");
 	fprintf(out, "\nExamples:\n");
 	fprintf(out, "  %s tar2xqcn backup.tar\n", __progname);
+	fprintf(out, "  %s tar2xqcn backup.tar -o my_backup.xqcn\n", __progname);
 	fprintf(out, "  %s tar2xqcn backup.tar my_backup.xqcn\n", __progname);
 }
 
 static int qdl_tar2xqcn(int argc, char **argv)
 {
+	const char *input;
+	const char *output;
+
 	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
 	    strcmp(argv[1], "--help") == 0) {
 		print_tar2xqcn_help(argc < 2 ? stderr : stdout);
 		return argc < 2 ? 1 : 0;
 	}
 
-	const char *input = argv[1];
-	const char *output = argc >= 3 ? argv[2] : "output.xqcn";
+	if (parse_in_out(argc, argv, "output.xqcn", &input, &output) < 0) {
+		print_tar2xqcn_help(stderr);
+		return 1;
+	}
 
 	return !!diag_tar_to_xqcn(input, output);
 }
