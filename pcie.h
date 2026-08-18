@@ -3,6 +3,7 @@
 #define __PCIE_H__
 
 #include <stdint.h>
+#include <stdio.h>
 
 struct qdl_device;
 
@@ -65,5 +66,6 @@ struct bhi_info {
 
 struct qdl_device *pcie_init(void);
 int pcie_has_device(void);
+int list_pcie_devices(FILE *out);
 
 #endif /* __PCIE_H__ */
