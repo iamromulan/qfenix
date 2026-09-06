@@ -42,6 +42,9 @@ static const struct edl_id edl_ids[] = {
 	{ 0x19d2, 0x0076 },
 	/* LG */
 	{ 0x1004, 0x61a1 },	/* LG memory debug */
+	/* Foxconn */
+	{ 0x105b, 0xe0ab },	/* Foxconn Custom EDL T99W175 */
+	{ 0x105b, 0xe0f5 },	/* Foxconn Custom EDL T99W373 */
 };
 
 /*
@@ -53,6 +56,7 @@ static const uint16_t diag_vids[] = {
 	0x2c7c,		/* Quectel */
 	0x05c6,		/* Qualcomm */
 	0x3c93,		/* Foxconn */
+	0x105b,		/* Foxconn */	
 	0x3763,		/* Sierra (alternate) */
 	0x1199,		/* Sierra Wireless */
 	0x19d2,		/* ZTE */

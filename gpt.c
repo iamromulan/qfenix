@@ -66,7 +66,7 @@ struct smem_flash_ptable {
  * Try to detect NAND page size by reading sector 0 with different sizes.
  * Returns the working sector size, or 0 on failure.
  */
-static size_t nand_detect_sector_size(struct qdl_device *qdl)
+size_t nand_detect_sector_size(struct qdl_device *qdl)
 {
 	static const size_t sizes[] = { 4096, 2048 };
 	uint8_t buf[4096];
@@ -648,7 +648,17 @@ static int gpt_print_table_from_partition(struct qdl_device *qdl,
 	}
 
 	if (memcmp(gpt.signature, "EFI PART", 8)) {
-		ux_err("partition %d has no GPT header\n", phys_partition);
+		/*
+		 * Only physical partition 0 is expected to carry a GPT on
+		 * eMMC (the user area).  The additional physical partitions
+		 * (eMMC boot/RPMB/GPP, or unused UFS LUNs) legitimately have
+		 * no GPT, so treat their absence as a normal skip rather than
+		 * an error to keep the output clean.
+		 */
+		if (phys_partition == 0)
+			ux_err("partition %d has no GPT header\n", phys_partition);
+		else
+			ux_debug("partition %d has no GPT header\n", phys_partition);
 		return 0;
 	}
 

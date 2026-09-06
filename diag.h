@@ -45,10 +45,11 @@
 /* EFS write/modify commands */
 #define EFS2_DIAG_WRITE		5
 #define EFS2_DIAG_SYMLINK	6
-#define EFS2_DIAG_UNLINK	7
-#define EFS2_DIAG_RMDIR		8
+#define EFS2_DIAG_READLINK	7
+#define EFS2_DIAG_UNLINK	8
 #define EFS2_DIAG_MKDIR		9
-#define EFS2_DIAG_READLINK	14
+#define EFS2_DIAG_RMDIR		10
+#define EFS2_DIAG_RENAME	14
 #define EFS2_DIAG_CHMOD		18
 
 /* EFS space/info commands */

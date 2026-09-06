@@ -60,7 +60,14 @@
 
 #define DEBUG_BLOCK_SIZE (512u * 1024u)
 
-#define SAHARA_CMD_TIMEOUT_MS	1000
+/*
+ * Sahara command read/write timeout.  Runtime-configurable via the global
+ * --sahara-timeout switch; when not given it falls back to the default
+ * below (1 s).  Higher values help on high-latency transports (usb-ip).
+ */
+#define SAHARA_DEFAULT_TIMEOUT_MS	1000
+int sahara_timeout_ms = SAHARA_DEFAULT_TIMEOUT_MS;
+#define SAHARA_CMD_TIMEOUT_MS	sahara_timeout_ms
 
 struct sahara_pkt {
 	uint32_t cmd;

@@ -3,8 +3,17 @@
 #define __GPT_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 
 struct qdl_device;
+
+/*
+ * Detect the device sector/page size by reading sector 0 with candidate
+ * sizes.  Returns the working size, or 0 on failure.  Useful on NAND, where
+ * the configure-time sector-size probe is skipped and qdl->sector_size is
+ * left at 0.
+ */
+size_t nand_detect_sector_size(struct qdl_device *qdl);
 
 int gpt_find_by_name(struct qdl_device *qdl, const char *name, int *partition,
 		     unsigned int *start_sector, unsigned int *num_sectors);

@@ -130,6 +130,7 @@ int firehose_detect_and_configure(struct qdl_device *qdl,
 				  enum qdl_storage_type storage,
 				  unsigned int timeout_s);
 int firehose_power(struct qdl_device *qdl, const char *mode, int delay);
+int firehose_probe(struct qdl_device *qdl);
 int firehose_program_file(struct qdl_device *qdl, unsigned int partition,
 			  unsigned int start_sector, unsigned int max_sectors,
 			  unsigned int sector_size, unsigned int pages_per_block,
@@ -152,6 +153,7 @@ struct storage_info {
 int firehose_getstorageinfo(struct qdl_device *qdl,
 			    unsigned int phys_partition,
 			    struct storage_info *info);
+extern int sahara_timeout_ms;
 int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	       const char *ramdump_path,
 	       const char *ramdump_filter);
@@ -160,6 +162,8 @@ int decode_programmer(char *s, struct sahara_image *images);
 void sahara_images_free(struct sahara_image *images, size_t count);
 void print_hex_dump(const char *prefix, const void *buf, size_t len);
 unsigned int attr_as_unsigned(xmlNode *node, const char *attr, int *errors);
+unsigned int attr_as_unsigned_default(xmlNode *node, const char *attr,
+				      unsigned int def);
 const char *attr_as_string(xmlNode *node, const char *attr, int *errors);
 bool attr_as_bool(xmlNode *node, const char *attr, int *errors);
 

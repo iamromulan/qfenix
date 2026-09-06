@@ -546,6 +546,43 @@ static int firehose_try_configure(struct qdl_device *qdl, bool skip_storage_init
 	return 0;
 }
 
+/*
+ * Probe whether a Firehose programmer is already running on the device.
+ *
+ * Sends a single <nop> and waits briefly for a response.  Returns true if
+ * the loader answered (ACK) — i.e. the device is already in Firehose mode
+ * and the Sahara programmer upload can be skipped (e.g. after a previous
+ * run that used --no-reset).  Returns false on timeout / no valid response,
+ * in which case the caller should fall back to the normal Sahara handshake.
+ *
+ * The short timeout keeps the fresh-EDL path fast; sending a nop to a device
+ * still in PBL/Sahara mode is harmless (the PBL ignores non-Sahara bytes).
+ */
+int firehose_probe(struct qdl_device *qdl)
+{
+	xmlNode *root;
+	xmlNode *node;
+	xmlDoc *doc;
+	int ret;
+
+	if (qdl->dev_type == QDL_DEVICE_SIM)
+		return 0;
+
+	doc = xmlNewDoc((xmlChar *)"1.0");
+	root = xmlNewNode(NULL, (xmlChar *)"data");
+	xmlDocSetRootElement(doc, root);
+	node = xmlNewChild(root, NULL, (xmlChar *)"nop", NULL);
+	xml_setpropf(node, "value", "ping");
+
+	ret = firehose_write(qdl, doc);
+	xmlFreeDoc(doc);
+	if (ret < 0)
+		return 0;
+
+	ret = firehose_read(qdl, 2000, firehose_generic_parser, NULL);
+	return ret == FIREHOSE_ACK;
+}
+
 static int firehose_erase(struct qdl_device *qdl, struct program *program)
 {
 	unsigned int sector_size;
@@ -976,25 +1013,57 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 
 drain:
 	/*
-	 * Drain remaining rawmode data and the closing ACK so the
-	 * stream is re-synchronised for subsequent commands.
-	 * On failure (mid-read error) discard whatever remains;
-	 * on success this consumes the normal rawmode=false ACK.
+	 * Re-synchronise the stream after the raw transfer.
+	 *
+	 * On error, discard whatever is still buffered, flush the wire and
+	 * consume the loader's response.
 	 */
-	fh_remainder_len = 0;
 	if (ret) {
 		int drain_n;
 
+		fh_remainder_len = 0;
 		do {
 			drain_n = qdl_read(qdl, buf, buf_size, 2000);
 		} while (drain_n > 0);
-	}
 
-	if (firehose_read(qdl, 10000, firehose_generic_parser, NULL)) {
-		if (!ret)
-			ux_err("read operation failed\n");
+		firehose_read(qdl, 10000, firehose_generic_parser, NULL);
 		ret = -1;
 		goto out;
+	}
+
+	/*
+	 * Success: consume the closing rawmode=false ACK so the stream is
+	 * re-synchronised for the next command.
+	 *
+	 * On serial / usb-ip transports the closing ACK is very often
+	 * delivered in the SAME read as the raw payload (typical for small
+	 * single-sector reads such as GPT and sector-size probing), so it is
+	 * already sitting in the remainder buffer.  If the remainder holds a
+	 * complete response (contains "</data>"), the ACK has already been
+	 * received: consume it from there instead of waiting on the wire.
+	 *
+	 * The previous code cleared the remainder unconditionally and then
+	 * always read the closing ACK from the device, which timed out on
+	 * these transports and misreported a perfectly good read as
+	 * "read operation failed".
+	 */
+	if (fh_remainder_len > 0 &&
+	    find_in_mem(fh_remainder, fh_remainder_len, "</data>", 7)) {
+		fh_remainder_len = 0;
+	} else {
+		fh_remainder_len = 0;
+		if (firehose_read(qdl, 10000, firehose_generic_parser, NULL)) {
+			/*
+			 * The data transfer itself already completed (all
+			 * requested sectors were received above), so a missing
+			 * or late closing ACK must not fail the read.  Any
+			 * stray ACK left on the wire is harmless: the next
+			 * command's firehose_read() consumes leftover messages
+			 * until it finds its own response.
+			 */
+			ux_debug("closing rawmode ACK not received; "
+				 "data is complete, continuing\n");
+		}
 	}
 
 	t = time(NULL) - t0;
